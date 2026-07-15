@@ -130,24 +130,6 @@ Or with coverage:
 ```bash
 cargo llvm-cov nextest --html --lcov
 ```
-
-## Project Structure
-
-```
-guajara/
-├── Cargo.toml
-├── Makefile
-├── README.md
-├── .github/workflows/ci.yml
-├── src/
-│   ├── lib.rs         # Re-exports, shared utilities (diff, file I/O)
-│   ├── ssh.rs         # SSH config parser, document model, operations
-│   ├── hosts.rs       # Hosts file parser, document model, operations
-│   └── main.rs        # CLI (clap) + Ratatui TUI
-└── tests/
-    └── integration.rs # Integration tests
-```
-
 ## CI
 
 A GitHub Actions workflow runs on pushes and PRs to `main`. It checks formatting,
