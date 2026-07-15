@@ -661,6 +661,7 @@ struct TuiApp {
     form_focus: usize,
     form_edit_buffer: String,
     form_edit_active: bool,
+    should_quit: bool,
 }
 
 impl TuiApp {
@@ -679,6 +680,7 @@ impl TuiApp {
             form_focus: 0,
             form_edit_buffer: String::new(),
             form_edit_active: false,
+            should_quit: false,
         };
         if let Some(init) = init {
             match init {
@@ -944,7 +946,7 @@ fn run_tui(ssh_path: &Path, hosts_path: &Path, init: Option<InitScreen>) {
                 continue;
             }
             handle_tui_key(&mut app, key);
-            if matches!(app.screen, TuiScreen::MainMenu) && key.code == KeyCode::Char('q') {
+            if app.should_quit {
                 break;
             }
         }
@@ -977,6 +979,9 @@ fn handle_tui_key(app: &mut TuiApp, key: event::KeyEvent) {
                 app.selected = 0;
             }
         },
+        KeyCode::Char('q') => {
+            app.should_quit = true;
+        }
         KeyCode::Char('j') | KeyCode::Down => {
             let n = match app.screen {
                 TuiScreen::MainMenu => 4,
@@ -1025,7 +1030,7 @@ fn handle_tui_key(app: &mut TuiApp, key: event::KeyEvent) {
                     });
                     app.status = Some(m.join(" | "));
                 }
-                3 => {}
+                3 => app.should_quit = true,
                 _ => {}
             },
             TuiScreen::SshList => {
