@@ -707,7 +707,6 @@ impl TuiApp {
     // ── SSH save ────────────────────────────────────────
 
     fn save_ssh(&mut self) -> Option<String> {
-        let old = self.ssh_config.to_string();
         match self.screen {
             TuiScreen::SshAddForm => {
                 let pat: Vec<String> = self.form_fields[0]
@@ -736,12 +735,13 @@ impl TuiApp {
                 if new_pat.is_empty() {
                     return Some("Patterns cannot be empty".to_string());
                 }
-                for p in &hosts[idx].patterns {
-                    let _ = self.ssh_config.remove_pattern(start, p);
-                }
-                for p in &new_pat {
-                    let _ = self.ssh_config.add_pattern(start, p);
-                }
+                // Replace the header line directly instead of remove+add patterns
+                let indent: String = self.ssh_config.lines[start]
+                    .chars()
+                    .take_while(|c| c.is_whitespace())
+                    .collect();
+                let new_header = format!("{}Host {}", indent, new_pat.join(" "));
+                self.ssh_config.lines[start] = new_header;
                 for (label, val) in &self.form_fields[1..5] {
                     if val.is_empty() {
                         let _ = self.ssh_config.unset(start, label);
@@ -752,9 +752,7 @@ impl TuiApp {
             }
             _ => {}
         }
-        let new = self.ssh_config.to_string();
-        eprintln!("{}", diff(&old, &new));
-        match write_file(&self.ssh_path, &new) {
+        match write_file(&self.ssh_path, &self.ssh_config.to_string()) {
             Ok(()) => {
                 self.reload();
                 self.status = Some("SSH config saved".to_string());
@@ -767,7 +765,6 @@ impl TuiApp {
     // ── Hosts save ──────────────────────────────────────
 
     fn save_hosts(&mut self) -> Option<String> {
-        let old = self.hosts_file.to_string();
         match self.screen {
             TuiScreen::HostsAddForm => {
                 let ip = self.form_fields[0].1.clone();
@@ -796,19 +793,29 @@ impl TuiApp {
                     return Some("IP and hostname required".to_string());
                 }
                 let c = &self.form_fields[2].1;
-                let cs = if c.is_empty() {
+                let record = &records[idx];
+                // Preserve original indentation and comment style
+                let indent: String = self.hosts_file.lines[record.line_idx]
+                    .chars()
+                    .take_while(|c| c.is_whitespace())
+                    .collect();
+                let comment_str = if c.is_empty() {
                     String::new()
                 } else {
-                    format!("\t#{}", c)
+                    // Preserve the original comment marker style (with or without space after #)
+                    if let Some(pos) = record.raw.find('#') {
+                        let orig_marker = &record.raw[pos..];
+                        format!(" {}", orig_marker)
+                    } else {
+                        format!(" #{}", c)
+                    }
                 };
-                self.hosts_file.lines[records[idx].line_idx] =
-                    format!("{}\t{}{}", ip, h.join(" "), cs);
+                self.hosts_file.lines[record.line_idx] =
+                    format!("{}{}\t{}{}", indent, ip, h.join(" "), comment_str);
             }
             _ => {}
         }
-        let new = self.hosts_file.to_string();
-        eprintln!("{}", diff(&old, &new));
-        match write_file(&self.hosts_path, &new) {
+        match write_file(&self.hosts_path, &self.hosts_file.to_string()) {
             Ok(()) => {
                 self.reload();
                 self.status = Some("Hosts file saved".to_string());

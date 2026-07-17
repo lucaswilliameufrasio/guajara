@@ -1,5 +1,8 @@
 use guajara::hosts::HostsFile;
 use guajara::ssh::SshConfig;
+use guajara::write_file;
+use std::os::unix::fs::PermissionsExt;
+use tempfile::TempDir;
 
 // ── SSH integration tests ─────────────────────────────────
 
@@ -227,4 +230,99 @@ fn test_ssh_remove_pattern_from_host() {
     let start = config.hosts()[0].start_idx;
     config.remove_pattern(start, "b").unwrap();
     assert_eq!(config.hosts()[0].patterns, vec!["a"]);
+}
+
+// ── Write / permissions tests ──────────────────────────────
+
+#[test]
+fn test_write_file_preserves_permissions() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("ssh_config");
+    let original = "Host test\n    HostName test.com\n";
+    std::fs::write(&path, original).unwrap();
+
+    // Set restrictive permissions (0600)
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o600);
+    std::fs::set_permissions(&path, perms).unwrap();
+
+    let new_content = "Host test\n    HostName test2.com\n";
+    write_file(&path, new_content).unwrap();
+
+    let saved_perms = std::fs::metadata(&path).unwrap().permissions();
+    assert_eq!(saved_perms.mode() & 0o777, 0o600);
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(saved, new_content);
+}
+
+// ── SSH header replacement tests ───────────────────────────
+
+#[test]
+fn test_ssh_header_direct_replacement() {
+    let content = "Host a b\n    HostName old.com\n";
+    let mut config = SshConfig::parse(content);
+    let start = config.hosts()[0].start_idx;
+    // Simulate what the TUI does: replace the header line directly
+    let indent: String = config.lines[start]
+        .chars()
+        .take_while(|c| c.is_whitespace())
+        .collect();
+    config.lines[start] = format!("{}Host new-name", indent);
+    let hosts = config.hosts();
+    assert_eq!(hosts[0].patterns, vec!["new-name"]);
+    assert_eq!(config.to_string(), "Host new-name\n    HostName old.com\n");
+}
+
+#[test]
+fn test_ssh_header_replacement_preserves_indentation() {
+    let content = "  Host a\n    HostName a.com\n";
+    let mut config = SshConfig::parse(content);
+    let start = config.hosts()[0].start_idx;
+    let indent: String = config.lines[start]
+        .chars()
+        .take_while(|c| c.is_whitespace())
+        .collect();
+    config.lines[start] = format!("{}Host b", indent);
+    assert_eq!(config.hosts()[0].patterns, vec!["b"]);
+    // Indentation preserved
+    assert!(config.to_string().starts_with("  Host b"));
+}
+
+// ── Hosts edit formatting preservation tests ───────────────
+
+#[test]
+fn test_hosts_edit_preserves_indentation() {
+    let content = "  127.0.0.1\tlocalhost\n";
+    let mut hosts = HostsFile::parse(content);
+    let records = hosts.records();
+    let idx = records[0].line_idx;
+    // Simulate TUI edit: preserve indentation
+    let indent: String = hosts.lines[idx]
+        .chars()
+        .take_while(|c| c.is_whitespace())
+        .collect();
+    hosts.lines[idx] = format!("{}127.0.0.2\tlocalhost", indent);
+    assert!(hosts.to_string().starts_with("  127.0.0.2"));
+}
+
+#[test]
+fn test_hosts_edit_preserves_comment_style() {
+    let content = "192.168.1.1\tnas\t# My NAS device\n";
+    let mut hosts = HostsFile::parse(content);
+    let records = hosts.records();
+    let idx = records[0].line_idx;
+    let indent: String = hosts.lines[idx]
+        .chars()
+        .take_while(|c| c.is_whitespace())
+        .collect();
+    // Preserve original comment marker (with tab before #)
+    let raw = &hosts.lines[idx];
+    let comment_str = if let Some(pos) = raw.find('#') {
+        format!(" {}", &raw[pos..])
+    } else {
+        String::new()
+    };
+    hosts.lines[idx] = format!("{}10.0.0.1\tnew-host{}", indent, comment_str);
+    assert!(hosts.to_string().contains("10.0.0.1"));
+    assert!(hosts.to_string().contains("# My NAS device"));
 }

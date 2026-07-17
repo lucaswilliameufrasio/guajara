@@ -23,6 +23,14 @@ pub fn read_file(path: &std::path::Path) -> Result<String, String> {
 pub fn write_file(path: &std::path::Path, content: &str) -> Result<(), String> {
     let tmp = path.with_extension("guajara-tmp");
     std::fs::write(&tmp, content).map_err(|e| format!("Cannot write {}: {}", tmp.display(), e))?;
+    // Preserve original file permissions if the file exists
+    if let Ok(meta) = std::fs::metadata(path) {
+        let perms = meta.permissions();
+        if let Err(e) = std::fs::set_permissions(&tmp, perms) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("Cannot set permissions: {}", e));
+        }
+    }
     std::fs::rename(&tmp, path).map_err(|e| format!("Cannot rename {}: {}", path.display(), e))?;
     Ok(())
 }
