@@ -636,6 +636,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 use ratatui::{Frame, Terminal};
 use std::io::stdout;
+use std::time::{Duration, Instant};
 
 enum TuiScreen {
     MainMenu,
@@ -657,6 +658,7 @@ struct TuiApp {
     hosts_path: PathBuf,
     selected: usize,
     status: Option<String>,
+    status_expires_at: Option<Instant>,
     form_fields: Vec<(String, String)>,
     form_focus: usize,
     form_edit_buffer: String,
@@ -676,6 +678,7 @@ impl TuiApp {
             hosts_path: hosts_path.to_path_buf(),
             selected: 0,
             status: None,
+            status_expires_at: None,
             form_fields: Vec::new(),
             form_focus: 0,
             form_edit_buffer: String::new(),
@@ -702,6 +705,11 @@ impl TuiApp {
         let h = read_file(&self.hosts_path).unwrap_or_default();
         self.ssh_config = SshConfig::parse(&s);
         self.hosts_file = HostsFile::parse(&h);
+    }
+
+    fn set_status(&mut self, msg: String) {
+        self.status = Some(msg);
+        self.status_expires_at = Some(Instant::now() + Duration::from_secs(3));
     }
 
     // ── SSH save ────────────────────────────────────────
@@ -755,7 +763,7 @@ impl TuiApp {
         match write_file(&self.ssh_path, &self.ssh_config.to_string()) {
             Ok(()) => {
                 self.reload();
-                self.status = Some("SSH config saved".to_string());
+                self.set_status("SSH config saved".to_string());
                 None
             }
             Err(e) => Some(e),
@@ -818,7 +826,7 @@ impl TuiApp {
         match write_file(&self.hosts_path, &self.hosts_file.to_string()) {
             Ok(()) => {
                 self.reload();
-                self.status = Some("Hosts file saved".to_string());
+                self.set_status("Hosts file saved".to_string());
                 None
             }
             Err(e) => Some(e),
@@ -945,17 +953,18 @@ fn run_tui(ssh_path: &Path, hosts_path: &Path, init: Option<InitScreen>) {
 
     loop {
         terminal.draw(|f| render_tui(f, &mut app)).ok();
-        if let Event::Key(key) = event::read()
+        if event::poll(Duration::from_millis(200))
             .ok()
-            .unwrap_or(Event::Key(KeyCode::Esc.into()))
+            .unwrap_or(false)
+            && let Event::Key(key) = event::read()
+                .ok()
+                .unwrap_or(Event::Key(KeyCode::Esc.into()))
+            && key.kind == KeyEventKind::Press
         {
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
             handle_tui_key(&mut app, key);
-            if app.should_quit {
-                break;
-            }
+        }
+        if app.should_quit {
+            break;
         }
     }
     disable_raw_mode().ok();
@@ -1087,13 +1096,13 @@ fn handle_tui_key(app: &mut TuiApp, key: event::KeyEvent) {
                 let _ = app
                     .ssh_config
                     .remove_block(app.ssh_config.hosts()[app.selected].start_idx);
-                app.status = Some(format!("Removed '{}' — save with s", p));
+                app.set_status(format!("Removed '{}' — save with s", p));
                 app.clamp_ssh_sel();
             }
             TuiScreen::HostsList if app.selected < app.hosts_file.records().len() => {
                 let e = app.hosts_file.records()[app.selected].hostnames.join(" ");
                 let _ = app.hosts_file.remove(app.selected);
-                app.status = Some(format!("Removed '{}' — save with s", e));
+                app.set_status(format!("Removed '{}' — save with s", e));
                 app.clamp_hosts_sel();
             }
             _ => {}
@@ -1113,7 +1122,7 @@ fn handle_tui_key(app: &mut TuiApp, key: event::KeyEvent) {
         },
         KeyCode::Char('r') => {
             app.reload();
-            app.status = Some("Reloaded".to_string());
+            app.set_status("Reloaded".to_string());
         }
         _ => {}
     }
@@ -1171,7 +1180,7 @@ fn handle_form_key(app: &mut TuiApp, key: event::KeyEvent) {
                 if let Some(e) = err {
                     app.status = Some(e);
                 } else {
-                    app.status = Some("Saved".to_string());
+                    app.set_status("Saved".to_string());
                     app.screen = match app.screen {
                         TuiScreen::SshAddForm | TuiScreen::SshEditForm(_) => TuiScreen::SshList,
                         _ => TuiScreen::HostsList,
@@ -1197,6 +1206,14 @@ fn handle_form_key(app: &mut TuiApp, key: event::KeyEvent) {
 // ── Rendering ──────────────────────────────────────────────
 
 fn render_tui(frame: &mut Frame, app: &mut TuiApp) {
+    // Clear expired status messages
+    if let Some(expires) = app.status_expires_at
+        && Instant::now() >= expires
+    {
+        app.status = None;
+        app.status_expires_at = None;
+    }
+
     let size = frame.area();
     if size.width < 30 || size.height < 10 {
         return;
