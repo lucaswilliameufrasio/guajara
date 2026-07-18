@@ -633,7 +633,7 @@ use crossterm::terminal::{
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 use ratatui::{Frame, Terminal};
 use std::io::stdout;
 use std::time::{Duration, Instant};
@@ -650,6 +650,19 @@ enum TuiScreen {
     HostsEditForm(usize),
 }
 
+enum PopupKind {
+    Success,
+    Error,
+    Info,
+}
+
+struct Popup {
+    kind: PopupKind,
+    title: String,
+    message: String,
+    expires_at: Option<Instant>,
+}
+
 struct TuiApp {
     screen: TuiScreen,
     ssh_config: SshConfig,
@@ -664,6 +677,7 @@ struct TuiApp {
     form_edit_buffer: String,
     form_edit_active: bool,
     should_quit: bool,
+    popup: Option<Popup>,
 }
 
 impl TuiApp {
@@ -684,6 +698,7 @@ impl TuiApp {
             form_edit_buffer: String::new(),
             form_edit_active: false,
             should_quit: false,
+            popup: None,
         };
         if let Some(init) = init {
             match init {
@@ -710,6 +725,21 @@ impl TuiApp {
     fn set_status(&mut self, msg: String) {
         self.status = Some(msg);
         self.status_expires_at = Some(Instant::now() + Duration::from_secs(3));
+    }
+
+    fn show_popup(&mut self, kind: PopupKind, title: String, message: String) {
+        let expires_at = match kind {
+            PopupKind::Success => Some(Instant::now() + Duration::from_secs(3)),
+            PopupKind::Error | PopupKind::Info => None,
+        };
+        self.popup = Some(Popup {
+            kind,
+            title,
+            message,
+            expires_at,
+        });
+        self.status = None;
+        self.status_expires_at = None;
     }
 
     // ── SSH save ────────────────────────────────────────
@@ -763,7 +793,11 @@ impl TuiApp {
         match write_file(&self.ssh_path, &self.ssh_config.to_string()) {
             Ok(()) => {
                 self.reload();
-                self.set_status("SSH config saved".to_string());
+                self.show_popup(
+                    PopupKind::Success,
+                    "Saved".into(),
+                    "SSH config saved".into(),
+                );
                 None
             }
             Err(e) => Some(e),
@@ -826,7 +860,11 @@ impl TuiApp {
         match write_file(&self.hosts_path, &self.hosts_file.to_string()) {
             Ok(()) => {
                 self.reload();
-                self.set_status("Hosts file saved".to_string());
+                self.show_popup(
+                    PopupKind::Success,
+                    "Saved".into(),
+                    "Hosts file saved".into(),
+                );
                 None
             }
             Err(e) => Some(e),
@@ -975,6 +1013,14 @@ fn run_tui(ssh_path: &Path, hosts_path: &Path, init: Option<InitScreen>) {
 // ── Key handling ──────────────────────────────────────────
 
 fn handle_tui_key(app: &mut TuiApp, key: event::KeyEvent) {
+    // Popup takes priority — Enter or Esc dismisses it
+    if app.popup.is_some() {
+        if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
+            app.popup = None;
+        }
+        return;
+    }
+
     // Delegate to form handler if in a form screen
     if matches!(
         app.screen,
@@ -1031,20 +1077,33 @@ fn handle_tui_key(app: &mut TuiApp, key: event::KeyEvent) {
                     app.selected = 0;
                 }
                 2 => {
-                    let mut m = Vec::new();
+                    let mut parts = Vec::new();
                     let se = app.ssh_config.validate();
                     let he = app.hosts_file.validate();
-                    m.push(if se.is_empty() {
-                        "SSH: valid".into()
+                    parts.push(if se.is_empty() {
+                        "✓ SSH config is valid".into()
                     } else {
-                        format!("SSH: {} error(s)", se.len())
+                        format!("✗ SSH: {} error(s)", se.len())
                     });
-                    m.push(if he.is_empty() {
-                        "Hosts: valid".into()
+                    parts.push(if he.is_empty() {
+                        "✓ Hosts file is valid".into()
                     } else {
-                        format!("Hosts: {} error(s)", he.len())
+                        format!("✗ Hosts: {} error(s)", he.len())
                     });
-                    app.status = Some(m.join(" | "));
+                    let mut msg = parts.join("\n");
+                    if !se.is_empty() {
+                        msg.push_str("\n\nSSH errors:");
+                        for e in &se {
+                            msg.push_str(&format!("\n  {}", e));
+                        }
+                    }
+                    if !he.is_empty() {
+                        msg.push_str("\n\nHosts errors:");
+                        for e in &he {
+                            msg.push_str(&format!("\n  {}", e));
+                        }
+                    }
+                    app.show_popup(PopupKind::Info, "Validation".into(), msg);
                 }
                 3 => app.should_quit = true,
                 _ => {}
@@ -1110,12 +1169,12 @@ fn handle_tui_key(app: &mut TuiApp, key: event::KeyEvent) {
         KeyCode::Char('s') => match app.screen {
             TuiScreen::SshList => {
                 if let Some(e) = app.save_ssh() {
-                    app.status = Some(e);
+                    app.show_popup(PopupKind::Error, "Error".into(), e);
                 }
             }
             TuiScreen::HostsList => {
                 if let Some(e) = app.save_hosts() {
-                    app.status = Some(e);
+                    app.show_popup(PopupKind::Error, "Error".into(), e);
                 }
             }
             _ => {}
@@ -1129,6 +1188,14 @@ fn handle_tui_key(app: &mut TuiApp, key: event::KeyEvent) {
 }
 
 fn handle_form_key(app: &mut TuiApp, key: event::KeyEvent) {
+    // Popup takes priority
+    if app.popup.is_some() {
+        if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
+            app.popup = None;
+        }
+        return;
+    }
+
     if app.form_edit_active {
         match key.code {
             KeyCode::Enter => {
@@ -1178,7 +1245,7 @@ fn handle_form_key(app: &mut TuiApp, key: event::KeyEvent) {
                     _ => app.save_hosts(),
                 };
                 if let Some(e) = err {
-                    app.status = Some(e);
+                    app.show_popup(PopupKind::Error, "Error".into(), e);
                 } else {
                     app.set_status("Saved".to_string());
                     app.screen = match app.screen {
@@ -1205,6 +1272,48 @@ fn handle_form_key(app: &mut TuiApp, key: event::KeyEvent) {
 
 // ── Rendering ──────────────────────────────────────────────
 
+fn render_popup(frame: &mut Frame, area: Rect, popup: &Popup) {
+    let (border_color, title_icon) = match popup.kind {
+        PopupKind::Success => (Color::Green, " ✓ "),
+        PopupKind::Error => (Color::Red, " ✗ "),
+        PopupKind::Info => (Color::Cyan, " ℹ "),
+    };
+
+    let centered = area.centered(Constraint::Percentage(70), Constraint::Percentage(40));
+
+    frame.render_widget(Clear, centered);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color))
+        .title(format!("{}{}", title_icon, popup.title))
+        .title_style(
+            Style::default()
+                .fg(border_color)
+                .add_modifier(Modifier::BOLD),
+        );
+
+    let inner = block.inner(centered);
+    frame.render_widget(block, centered);
+
+    let lines: Vec<Line> = popup
+        .message
+        .lines()
+        .map(|l| Line::from(Span::raw(l.to_string())))
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
+
+    if popup.expires_at.is_none() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "Press Enter or Esc to close",
+                Style::default().fg(Color::DarkGray),
+            ))),
+            Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1),
+        );
+    }
+}
+
 fn render_tui(frame: &mut Frame, app: &mut TuiApp) {
     // Clear expired status messages
     if let Some(expires) = app.status_expires_at
@@ -1212,6 +1321,14 @@ fn render_tui(frame: &mut Frame, app: &mut TuiApp) {
     {
         app.status = None;
         app.status_expires_at = None;
+    }
+
+    // Auto-dismiss expired popups
+    if let Some(ref popup) = app.popup
+        && let Some(expires) = popup.expires_at
+        && Instant::now() >= expires
+    {
+        app.popup = None;
     }
 
     let size = frame.area();
@@ -1282,6 +1399,11 @@ fn render_tui(frame: &mut Frame, app: &mut TuiApp) {
         ))),
         lo[2],
     );
+
+    // Popup overlay
+    if let Some(ref popup) = app.popup {
+        render_popup(frame, frame.area(), popup);
+    }
 }
 
 fn render_main_menu(frame: &mut Frame, area: Rect, app: &mut TuiApp) {
