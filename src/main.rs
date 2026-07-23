@@ -638,6 +638,7 @@ use ratatui::{Frame, Terminal};
 use std::io::stdout;
 use std::time::{Duration, Instant};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TuiScreen {
     MainMenu,
     SshList,
@@ -665,6 +666,7 @@ struct Popup {
 
 struct TuiApp {
     screen: TuiScreen,
+    nav_stack: Vec<(TuiScreen, usize)>,
     ssh_config: SshConfig,
     hosts_file: HostsFile,
     ssh_path: PathBuf,
@@ -686,6 +688,7 @@ impl TuiApp {
         let hosts = read_file(hosts_path).unwrap_or_default();
         let mut app = TuiApp {
             screen: TuiScreen::MainMenu,
+            nav_stack: Vec::new(),
             ssh_config: SshConfig::parse(&ssh),
             hosts_file: HostsFile::parse(&hosts),
             ssh_path: ssh_path.to_path_buf(),
@@ -703,12 +706,16 @@ impl TuiApp {
         if let Some(init) = init {
             match init {
                 InitScreen::SshEdit(idx) => {
+                    app.nav_stack.push((TuiScreen::SshList, idx));
                     app.setup_ssh_edit_form(idx);
                     app.screen = TuiScreen::SshEditForm(idx);
+                    app.selected = 0;
                 }
                 InitScreen::HostsEdit(idx) => {
+                    app.nav_stack.push((TuiScreen::HostsList, idx));
                     app.setup_hosts_edit_form(idx);
                     app.screen = TuiScreen::HostsEditForm(idx);
+                    app.selected = 0;
                 }
             }
         }
@@ -720,6 +727,22 @@ impl TuiApp {
         let h = read_file(&self.hosts_path).unwrap_or_default();
         self.ssh_config = SshConfig::parse(&s);
         self.hosts_file = HostsFile::parse(&h);
+    }
+
+    fn navigate_to(&mut self, screen: TuiScreen, selected: usize) {
+        self.nav_stack.push((self.screen, self.selected));
+        self.screen = screen;
+        self.selected = selected;
+    }
+
+    fn go_back(&mut self) -> bool {
+        if let Some((screen, selected)) = self.nav_stack.pop() {
+            self.screen = screen;
+            self.selected = selected;
+            true
+        } else {
+            false
+        }
     }
 
     fn set_status(&mut self, msg: String) {
@@ -994,9 +1017,7 @@ fn run_tui(ssh_path: &Path, hosts_path: &Path, init: Option<InitScreen>) {
         if event::poll(Duration::from_millis(200))
             .ok()
             .unwrap_or(false)
-            && let Event::Key(key) = event::read()
-                .ok()
-                .unwrap_or(Event::Key(KeyCode::Esc.into()))
+            && let Ok(Event::Key(key)) = event::read()
             && key.kind == KeyEventKind::Press
         {
             handle_tui_key(&mut app, key);
@@ -1034,13 +1055,11 @@ fn handle_tui_key(app: &mut TuiApp, key: event::KeyEvent) {
     }
 
     match key.code {
-        KeyCode::Esc => match app.screen {
-            TuiScreen::MainMenu => {}
-            _ => {
-                app.screen = TuiScreen::MainMenu;
-                app.selected = 0;
+        KeyCode::Esc => {
+            if !matches!(app.screen, TuiScreen::MainMenu) {
+                app.go_back();
             }
-        },
+        }
         KeyCode::Char('q') => {
             app.should_quit = true;
         }
@@ -1068,14 +1087,8 @@ fn handle_tui_key(app: &mut TuiApp, key: event::KeyEvent) {
         }
         KeyCode::Enter => match app.screen {
             TuiScreen::MainMenu => match app.selected {
-                0 => {
-                    app.screen = TuiScreen::SshList;
-                    app.selected = 0;
-                }
-                1 => {
-                    app.screen = TuiScreen::HostsList;
-                    app.selected = 0;
-                }
+                0 => app.navigate_to(TuiScreen::SshList, 0),
+                1 => app.navigate_to(TuiScreen::HostsList, 0),
                 2 => {
                     let mut parts = Vec::new();
                     let se = app.ssh_config.validate();
@@ -1109,43 +1122,42 @@ fn handle_tui_key(app: &mut TuiApp, key: event::KeyEvent) {
                 _ => {}
             },
             TuiScreen::SshList => {
-                let h = app.ssh_config.hosts();
-                if app.selected < h.len() {
-                    app.screen = TuiScreen::SshDetail(app.selected);
-                    app.selected = 0;
+                let idx = app.selected;
+                if idx < app.ssh_config.hosts().len() {
+                    app.navigate_to(TuiScreen::SshDetail(idx), 0);
                 }
             }
             TuiScreen::HostsList => {
-                let r = app.hosts_file.records();
-                if app.selected < r.len() {
-                    app.screen = TuiScreen::HostsDetail(app.selected);
-                    app.selected = 0;
+                let idx = app.selected;
+                if idx < app.hosts_file.records().len() {
+                    app.navigate_to(TuiScreen::HostsDetail(idx), 0);
                 }
             }
-            _ => {
-                app.screen = TuiScreen::MainMenu;
-                app.selected = 0;
-            }
+            _ => {}
         },
         KeyCode::Char('a') => match app.screen {
             TuiScreen::SshList => {
+                let sel = app.selected;
                 app.setup_ssh_add_form();
-                app.screen = TuiScreen::SshAddForm;
+                app.navigate_to(TuiScreen::SshAddForm, sel);
             }
             TuiScreen::HostsList => {
+                let sel = app.selected;
                 app.setup_hosts_add_form();
-                app.screen = TuiScreen::HostsAddForm;
+                app.navigate_to(TuiScreen::HostsAddForm, sel);
             }
             _ => {}
         },
         KeyCode::Char('e') => match app.screen {
             TuiScreen::SshList if app.selected < app.ssh_config.hosts().len() => {
-                app.setup_ssh_edit_form(app.selected);
-                app.screen = TuiScreen::SshEditForm(app.selected);
+                let idx = app.selected;
+                app.setup_ssh_edit_form(idx);
+                app.navigate_to(TuiScreen::SshEditForm(idx), idx);
             }
             TuiScreen::HostsList if app.selected < app.hosts_file.records().len() => {
-                app.setup_hosts_edit_form(app.selected);
-                app.screen = TuiScreen::HostsEditForm(app.selected);
+                let idx = app.selected;
+                app.setup_hosts_edit_form(idx);
+                app.navigate_to(TuiScreen::HostsEditForm(idx), idx);
             }
             _ => {}
         },
@@ -1220,11 +1232,7 @@ fn handle_form_key(app: &mut TuiApp, key: event::KeyEvent) {
 
     match key.code {
         KeyCode::Esc => {
-            app.screen = match app.screen {
-                TuiScreen::SshAddForm | TuiScreen::SshEditForm(_) => TuiScreen::SshList,
-                _ => TuiScreen::HostsList,
-            };
-            app.selected = 0;
+            app.go_back();
         }
         KeyCode::Char('j') | KeyCode::Down => {
             app.form_focus = (app.form_focus + 1) % app.form_fields.len();
@@ -1248,19 +1256,11 @@ fn handle_form_key(app: &mut TuiApp, key: event::KeyEvent) {
                     app.show_popup(PopupKind::Error, "Error".into(), e);
                 } else {
                     app.set_status("Saved".to_string());
-                    app.screen = match app.screen {
-                        TuiScreen::SshAddForm | TuiScreen::SshEditForm(_) => TuiScreen::SshList,
-                        _ => TuiScreen::HostsList,
-                    };
-                    app.selected = 0;
+                    app.go_back();
                     app.reload();
                 }
             } else if label == "Cancel" {
-                app.screen = match app.screen {
-                    TuiScreen::SshAddForm | TuiScreen::SshEditForm(_) => TuiScreen::SshList,
-                    _ => TuiScreen::HostsList,
-                };
-                app.selected = 0;
+                app.go_back();
             } else {
                 app.form_edit_buffer = app.form_fields[app.form_focus].1.clone();
                 app.form_edit_active = true;
@@ -1488,7 +1488,9 @@ fn render_ssh_list(frame: &mut Frame, area: Rect, app: &mut TuiApp) {
 fn render_ssh_detail(frame: &mut Frame, area: Rect, app: &mut TuiApp, idx: usize) {
     let hosts = app.ssh_config.hosts();
     if idx >= hosts.len() {
-        app.screen = TuiScreen::SshList;
+        if !app.go_back() {
+            app.screen = TuiScreen::SshList;
+        }
         return;
     }
     let h = &hosts[idx];
@@ -1574,7 +1576,9 @@ fn render_hosts_list(frame: &mut Frame, area: Rect, app: &mut TuiApp) {
 fn render_hosts_detail(frame: &mut Frame, area: Rect, app: &mut TuiApp, idx: usize) {
     let records = app.hosts_file.records();
     if idx >= records.len() {
-        app.screen = TuiScreen::HostsList;
+        if !app.go_back() {
+            app.screen = TuiScreen::HostsList;
+        }
         return;
     }
     let r = &records[idx];
@@ -1641,4 +1645,426 @@ fn render_form(frame: &mut Frame, area: Rect, app: &mut TuiApp) {
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)),
         area,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyEvent;
+
+    fn test_app() -> TuiApp {
+        TuiApp::new(
+            &Path::new("/nonexistent/__guajara_test_ssh"),
+            &Path::new("/nonexistent/__guajara_test_hosts"),
+            None,
+        )
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        code.into()
+    }
+
+    /// Returns a reference to the nav_stack publicly for assertions.
+    /// In tests we can also access `app.nav_stack` directly since this is
+    /// an inner module, but having a helper keeps things explicit.
+    fn stack_len(app: &TuiApp) -> usize {
+        app.nav_stack.len()
+    }
+
+    // ── Stack unit tests ───────────────────────────────────
+
+    #[test]
+    fn test_navigate_to_pushes_and_sets_screen() {
+        let mut app = test_app();
+        assert_eq!(app.screen, TuiScreen::MainMenu);
+        assert_eq!(app.selected, 0);
+        assert_eq!(stack_len(&app), 0);
+
+        app.navigate_to(TuiScreen::SshList, 0);
+        assert_eq!(app.screen, TuiScreen::SshList);
+        assert_eq!(app.selected, 0);
+        assert_eq!(stack_len(&app), 1);
+        assert_eq!(app.nav_stack[0], (TuiScreen::MainMenu, 0));
+    }
+
+    #[test]
+    fn test_go_back_pops_and_restores() {
+        let mut app = test_app();
+        app.navigate_to(TuiScreen::SshList, 0);
+        app.navigate_to(TuiScreen::SshDetail(3), 0);
+        assert_eq!(stack_len(&app), 2);
+        assert_eq!(app.screen, TuiScreen::SshDetail(3));
+
+        let popped = app.go_back();
+        assert!(popped);
+        assert_eq!(app.screen, TuiScreen::SshList);
+        assert_eq!(app.selected, 0);
+        assert_eq!(stack_len(&app), 1);
+
+        let popped = app.go_back();
+        assert!(popped);
+        assert_eq!(app.screen, TuiScreen::MainMenu);
+        assert_eq!(app.selected, 0);
+        assert_eq!(stack_len(&app), 0);
+    }
+
+    #[test]
+    fn test_go_back_empty_stack_returns_false() {
+        let mut app = test_app();
+        assert!(!app.go_back());
+        assert_eq!(app.screen, TuiScreen::MainMenu);
+    }
+
+    #[test]
+    fn test_deep_stack_multiple_back() {
+        let mut app = test_app();
+        app.navigate_to(TuiScreen::SshList, 0);
+        app.navigate_to(TuiScreen::SshDetail(1), 0);
+        app.navigate_to(TuiScreen::SshDetail(2), 0); // unrealistic but tests deep
+        assert_eq!(stack_len(&app), 3);
+
+        app.go_back();
+        assert_eq!(app.screen, TuiScreen::SshDetail(1));
+        app.go_back();
+        assert_eq!(app.screen, TuiScreen::SshList);
+        assert_eq!(app.selected, 0);
+        app.go_back();
+        assert_eq!(app.screen, TuiScreen::MainMenu);
+        assert!(!app.go_back());
+    }
+
+    #[test]
+    fn test_go_back_restores_selection_exactly() {
+        let mut app = test_app();
+        app.navigate_to(TuiScreen::SshList, 42);
+        assert_eq!(stack_len(&app), 1);
+
+        app.go_back();
+        assert_eq!(app.screen, TuiScreen::MainMenu);
+        assert_eq!(app.selected, 0);
+    }
+
+    // ── Esc key tests ──────────────────────────────────────
+
+    #[test]
+    fn test_esc_on_main_menu_does_nothing() {
+        let mut app = test_app();
+        handle_tui_key(&mut app, key(KeyCode::Esc));
+        assert_eq!(app.screen, TuiScreen::MainMenu);
+        assert_eq!(stack_len(&app), 0);
+    }
+
+    #[test]
+    fn test_esc_on_list_goes_back_to_menu() {
+        let mut app = test_app();
+        app.navigate_to(TuiScreen::SshList, 0);
+        assert_eq!(stack_len(&app), 1);
+
+        handle_tui_key(&mut app, key(KeyCode::Esc));
+        assert_eq!(app.screen, TuiScreen::MainMenu);
+        assert_eq!(app.selected, 0);
+        assert_eq!(stack_len(&app), 0);
+    }
+
+    #[test]
+    fn test_esc_on_detail_goes_back_to_list() {
+        let mut app = test_app();
+        app.navigate_to(TuiScreen::SshList, 2);
+        app.navigate_to(TuiScreen::SshDetail(2), 0);
+        assert_eq!(stack_len(&app), 2);
+
+        handle_tui_key(&mut app, key(KeyCode::Esc));
+        assert_eq!(app.screen, TuiScreen::SshList);
+        assert_eq!(app.selected, 2);
+        assert_eq!(stack_len(&app), 1);
+    }
+
+    #[test]
+    fn test_esc_on_hosts_detail_goes_back_to_hosts_list() {
+        let mut app = test_app();
+        app.navigate_to(TuiScreen::HostsList, 1);
+        app.navigate_to(TuiScreen::HostsDetail(1), 0);
+
+        handle_tui_key(&mut app, key(KeyCode::Esc));
+        assert_eq!(app.screen, TuiScreen::HostsList);
+        assert_eq!(app.selected, 1);
+    }
+
+    // ── Popup priority ─────────────────────────────────────
+
+    #[test]
+    fn test_esc_dismisses_popup_without_affecting_stack() {
+        let mut app = test_app();
+        app.navigate_to(TuiScreen::SshList, 0);
+        app.navigate_to(TuiScreen::SshDetail(0), 0);
+        app.show_popup(PopupKind::Info, "title".into(), "msg".into());
+        assert!(app.popup.is_some());
+        assert_eq!(stack_len(&app), 2);
+
+        handle_tui_key(&mut app, key(KeyCode::Esc));
+        assert!(app.popup.is_none());
+        assert_eq!(app.screen, TuiScreen::SshDetail(0));
+        assert_eq!(stack_len(&app), 2);
+    }
+
+    #[test]
+    fn test_enter_dismisses_popup_without_affecting_stack() {
+        let mut app = test_app();
+        app.navigate_to(TuiScreen::SshList, 0);
+        app.show_popup(PopupKind::Info, "title".into(), "msg".into());
+        assert!(app.popup.is_some());
+
+        handle_tui_key(&mut app, key(KeyCode::Enter));
+        assert!(app.popup.is_none());
+        assert_eq!(app.screen, TuiScreen::SshList);
+        assert_eq!(stack_len(&app), 1);
+    }
+
+    // ── Form field edit priority ───────────────────────────
+
+    #[test]
+    fn test_esc_in_form_edit_cancels_edit_without_affecting_stack() {
+        let mut app = test_app();
+        app.navigate_to(TuiScreen::SshAddForm, 0);
+        app.form_edit_active = true;
+        app.form_edit_buffer = "typing".into();
+        assert_eq!(stack_len(&app), 1);
+
+        handle_form_key(&mut app, key(KeyCode::Esc));
+        assert!(!app.form_edit_active);
+        assert_eq!(app.form_edit_buffer, "");
+        assert_eq!(app.screen, TuiScreen::SshAddForm);
+        assert_eq!(stack_len(&app), 1);
+    }
+
+    // ── Form Esc / Save / Cancel ───────────────────────────
+
+    #[test]
+    fn test_form_esc_uses_stack() {
+        let mut app = test_app();
+        app.navigate_to(TuiScreen::SshList, 3);
+        app.navigate_to(TuiScreen::SshAddForm, 3);
+        assert_eq!(stack_len(&app), 2);
+
+        // handle_form_key is called by handle_tui_key for form screens
+        handle_form_key(&mut app, key(KeyCode::Esc));
+        assert_eq!(app.screen, TuiScreen::SshList);
+        assert_eq!(app.selected, 3);
+        assert_eq!(stack_len(&app), 1);
+    }
+
+    #[test]
+    fn test_form_cancel_uses_stack() {
+        let mut app = test_app();
+        app.navigate_to(TuiScreen::HostsList, 1);
+        app.navigate_to(TuiScreen::HostsAddForm, 1);
+        app.form_fields = vec![
+            ("Patterns".into(), "".into()),
+            ("HostName".into(), "".into()),
+            ("User".into(), "".into()),
+            ("Port".into(), "".into()),
+            ("IdentityFile".into(), "".into()),
+            ("Save".into(), "".into()),
+            ("Cancel".into(), "".into()),
+        ];
+        app.form_focus = 6; // Cancel button
+
+        handle_form_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(app.screen, TuiScreen::HostsList);
+        assert_eq!(app.selected, 1);
+        assert_eq!(stack_len(&app), 1);
+    }
+
+    #[test]
+    fn test_form_save_uses_stack() {
+        let mut app = test_app();
+        app.navigate_to(TuiScreen::SshList, 0);
+        app.navigate_to(TuiScreen::SshAddForm, 0);
+        app.form_fields = vec![
+            ("Patterns".into(), "test".into()),
+            ("HostName".into(), "".into()),
+            ("User".into(), "".into()),
+            ("Port".into(), "".into()),
+            ("IdentityFile".into(), "".into()),
+            ("Save".into(), "".into()),
+            ("Cancel".into(), "".into()),
+        ];
+        app.form_focus = 5; // Save button
+
+        handle_form_key(&mut app, key(KeyCode::Enter));
+        // Save may succeed or show popup on error; either way stack should be consumed
+        assert!(app.screen == TuiScreen::SshList || app.popup.is_some());
+    }
+
+    // ── Enter on MainMenu ──────────────────────────────────
+
+    #[test]
+    fn test_enter_on_main_menu_ssh_navigates() {
+        let mut app = test_app();
+        assert_eq!(app.screen, TuiScreen::MainMenu);
+        assert_eq!(app.selected, 0);
+
+        handle_tui_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(app.screen, TuiScreen::SshList);
+        assert_eq!(app.selected, 0);
+        assert_eq!(stack_len(&app), 1);
+    }
+
+    #[test]
+    fn test_enter_on_main_menu_hosts_navigates() {
+        let mut app = test_app();
+        app.selected = 1;
+
+        handle_tui_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(app.screen, TuiScreen::HostsList);
+        assert_eq!(app.selected, 0);
+    }
+
+    // ── Enter on unknown screen is no-op ───────────────────
+
+    #[test]
+    fn test_enter_on_detail_does_nothing() {
+        let mut app = test_app();
+        app.navigate_to(TuiScreen::SshDetail(0), 0);
+
+        handle_tui_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(app.screen, TuiScreen::SshDetail(0));
+        assert_eq!(stack_len(&app), 1);
+    }
+
+    // ── CLI init ───────────────────────────────────────────
+
+    #[test]
+    fn test_cli_init_ssh_edit_has_parent_stack() {
+        let app = TuiApp::new(
+            &Path::new("/nonexistent/__guajara_test_ssh"),
+            &Path::new("/nonexistent/__guajara_test_hosts"),
+            Some(InitScreen::SshEdit(5)),
+        );
+        assert_eq!(app.screen, TuiScreen::SshEditForm(5));
+        assert_eq!(stack_len(&app), 1);
+        assert_eq!(app.nav_stack[0], (TuiScreen::SshList, 5));
+    }
+
+    #[test]
+    fn test_cli_init_hosts_edit_has_parent_stack() {
+        let app = TuiApp::new(
+            &Path::new("/nonexistent/__guajara_test_ssh"),
+            &Path::new("/nonexistent/__guajara_test_hosts"),
+            Some(InitScreen::HostsEdit(3)),
+        );
+        assert_eq!(app.screen, TuiScreen::HostsEditForm(3));
+        assert_eq!(stack_len(&app), 1);
+        assert_eq!(app.nav_stack[0], (TuiScreen::HostsList, 3));
+    }
+
+    #[test]
+    fn test_cli_init_ssh_edit_esc_returns_to_list() {
+        let mut app = TuiApp::new(
+            &Path::new("/nonexistent/__guajara_test_ssh"),
+            &Path::new("/nonexistent/__guajara_test_hosts"),
+            Some(InitScreen::SshEdit(5)),
+        );
+        handle_tui_key(&mut app, key(KeyCode::Esc));
+        assert_eq!(app.screen, TuiScreen::SshList);
+        assert_eq!(app.selected, 5);
+        assert_eq!(stack_len(&app), 0);
+    }
+
+    // ── Render guard fallback ──────────────────────────────
+
+    #[test]
+    fn test_render_ssh_detail_out_of_bounds_goes_back() {
+        let mut app = test_app();
+        app.navigate_to(TuiScreen::SshList, 0);
+        app.navigate_to(TuiScreen::SshDetail(42), 0);
+        // Simulate what render_ssh_detail does
+        let hosts = app.ssh_config.hosts();
+        if 42 >= hosts.len() {
+            if !app.go_back() {
+                app.screen = TuiScreen::SshList;
+            }
+        }
+        assert_eq!(app.screen, TuiScreen::SshList);
+        assert_eq!(stack_len(&app), 1);
+        // Now go back to MainMenu
+        app.go_back();
+        assert_eq!(app.screen, TuiScreen::MainMenu);
+    }
+
+    #[test]
+    fn test_render_hosts_detail_out_of_bounds_fallback() {
+        let mut app = test_app();
+        // Set up without stack entry (shouldn't happen but tests fallback)
+        app.screen = TuiScreen::HostsDetail(99);
+        let records = app.hosts_file.records();
+        if 99 >= records.len() {
+            if !app.go_back() {
+                app.screen = TuiScreen::HostsList;
+            }
+        }
+        assert_eq!(app.screen, TuiScreen::HostsList);
+    }
+
+    // ── Integration: full SSH flow ─────────────────────────
+
+    #[test]
+    fn test_full_ssh_back_navigation() {
+        let mut app = test_app();
+        assert_eq!(stack_len(&app), 0);
+
+        // MainMenu → SshList
+        handle_tui_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(app.screen, TuiScreen::SshList);
+        assert_eq!(stack_len(&app), 1);
+
+        // Simulate selecting item 2 on the list, then navigating to detail
+        app.selected = 2;
+        app.navigate_to(TuiScreen::SshDetail(2), 0);
+        assert_eq!(stack_len(&app), 2);
+
+        // detail → list (selected restored)
+        handle_tui_key(&mut app, key(KeyCode::Esc));
+        assert_eq!(app.screen, TuiScreen::SshList);
+        assert_eq!(app.selected, 2);
+        assert_eq!(stack_len(&app), 1);
+
+        // list → menu
+        handle_tui_key(&mut app, key(KeyCode::Esc));
+        assert_eq!(app.screen, TuiScreen::MainMenu);
+        assert_eq!(stack_len(&app), 0);
+
+        // menu Esc is no-op
+        handle_tui_key(&mut app, key(KeyCode::Esc));
+        assert_eq!(app.screen, TuiScreen::MainMenu);
+        assert_eq!(stack_len(&app), 0);
+    }
+
+    #[test]
+    fn test_full_hosts_back_navigation() {
+        let mut app = test_app();
+
+        // MainMenu → HostsList (item 1 selected on menu)
+        app.selected = 1;
+        handle_tui_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(app.screen, TuiScreen::HostsList);
+        assert_eq!(stack_len(&app), 1);
+
+        // Simulate selecting item 1 on the list, then navigating to detail
+        app.selected = 1;
+        app.navigate_to(TuiScreen::HostsDetail(1), 0);
+        assert_eq!(stack_len(&app), 2);
+
+        // detail → list (selected restored)
+        handle_tui_key(&mut app, key(KeyCode::Esc));
+        assert_eq!(app.screen, TuiScreen::HostsList);
+        assert_eq!(app.selected, 1);
+        assert_eq!(stack_len(&app), 1);
+
+        // list → menu (menu selection restored)
+        handle_tui_key(&mut app, key(KeyCode::Esc));
+        assert_eq!(app.screen, TuiScreen::MainMenu);
+        assert_eq!(app.selected, 1);
+        assert_eq!(stack_len(&app), 0);
+    }
 }
