@@ -54,10 +54,7 @@ impl HostsFile {
         }
 
         let mut parts = data.split_whitespace();
-        let ip = match parts.next() {
-            Some(ip) => ip.to_string(),
-            None => return None,
-        };
+        let ip = parts.next()?.to_string();
         let hostnames: Vec<String> = parts.map(|s| s.to_string()).collect();
         if hostnames.is_empty() {
             return None;

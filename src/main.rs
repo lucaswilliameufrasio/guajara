@@ -3,8 +3,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use guajara::{
-    HOSTS_PATH, SSH_PATH, diff, expand_path, hosts::HostsFile, read_file, ssh::SshConfig,
-    write_file,
+    ForwardRule, ForwardState, HOSTS_PATH, SSH_PATH, diff, expand_path, forward, hosts::HostsFile,
+    read_file, ssh::SshConfig, write_file,
 };
 
 fn pad_right(s: &str, width: usize) -> String {
@@ -44,6 +44,7 @@ enum Commands {
     Tui,
     Ssh(SshCli),
     Hosts(HostsCli),
+    Forward(ForwardCli),
 }
 
 #[derive(clap::Args)]
@@ -103,6 +104,33 @@ enum HostsCommand {
     Validate,
 }
 
+#[derive(clap::Args)]
+struct ForwardCli {
+    #[command(subcommand)]
+    command: ForwardCommand,
+}
+
+#[derive(Subcommand)]
+enum ForwardCommand {
+    /// List active port forwarding tunnels
+    List,
+    /// Start a port forwarding tunnel for one host
+    Add {
+        #[arg(long)]
+        host: String,
+        #[arg(long)]
+        local_port: u16,
+        #[arg(long)]
+        target_host: String,
+        #[arg(long)]
+        target_port: u16,
+    },
+    /// Stop the tunnel running for a host
+    Stop { selector: String },
+    /// Stop all active tunnels
+    StopAll,
+}
+
 // ── Main ───────────────────────────────────────────────────
 
 fn main() {
@@ -123,6 +151,108 @@ fn main() {
         None | Some(Commands::Tui) => run_tui(&ssh_path, &hosts_path, None),
         Some(Commands::Ssh(ssh)) => run_ssh(ssh, &ssh_path, &hosts_path, &cli),
         Some(Commands::Hosts(h)) => run_hosts(h, &hosts_path, &ssh_path, &cli),
+        Some(Commands::Forward(f)) => run_forward(f, &cli),
+    }
+}
+
+// ── Forward CLI ────────────────────────────────────────────
+
+fn run_forward(fwd: &ForwardCli, cli: &Cli) {
+    let path = forward::state_path();
+    match &fwd.command {
+        ForwardCommand::List => cmd_forward_list(&path),
+        ForwardCommand::Add {
+            host,
+            local_port,
+            target_host,
+            target_port,
+        } => cmd_forward_add(&path, host, *local_port, target_host, *target_port, cli),
+        ForwardCommand::Stop { selector } => cmd_forward_stop(&path, selector),
+        ForwardCommand::StopAll => cmd_forward_stop_all(&path),
+    }
+}
+
+fn cmd_forward_list(path: &Path) {
+    let state = forward::active(path);
+    if state.tunnels.is_empty() {
+        println!("No active tunnels.");
+        return;
+    }
+    let host_width = state
+        .tunnels
+        .iter()
+        .map(|t| t.host.len())
+        .max()
+        .unwrap_or(4)
+        .min(40);
+    println!("{:<hw$}  {:<8}  RULES", "HOST", "PID", hw = host_width);
+    println!("{:-<hw$}  --------  -----", "", hw = host_width);
+    for t in &state.tunnels {
+        let rules = t
+            .rules
+            .iter()
+            .map(|r| r.describe())
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("{:<hw$}  {:<8}  {}", t.host, t.pid, rules, hw = host_width);
+    }
+}
+
+fn cmd_forward_add(
+    path: &Path,
+    host: &str,
+    local_port: u16,
+    target_host: &str,
+    target_port: u16,
+    cli: &Cli,
+) {
+    let rules: Vec<forward::ForwardRule> = vec![forward::ForwardRule {
+        host: host.to_string(),
+        local_port,
+        target_host: target_host.to_string(),
+        target_port,
+    }];
+    if let Err(e) = forward::validate_start(path, &rules) {
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
+    }
+    println!("Tunnel to start: {}: {}", host, rules[0].describe());
+    if cli.dry_run {
+        println!("[dry-run]");
+        return;
+    }
+    if !cli.yes && !confirm("Start?") {
+        return;
+    }
+    match forward::start_all(path, &rules) {
+        Ok(tunnels) => println!("Started {} tunnel(s).", tunnels.len()),
+        Err(e) => eprintln!("Error: {}", e),
+    }
+}
+
+fn cmd_forward_stop(path: &Path, selector: &str) {
+    match forward::stop_tunnel(path, selector) {
+        Ok(true) => println!("Stopped tunnel for '{}'.", selector),
+        Ok(false) => {
+            eprintln!("No active tunnel for '{}'", selector);
+            let state = forward::active(path);
+            if !state.tunnels.is_empty() {
+                eprintln!("Active tunnels:");
+                for t in &state.tunnels {
+                    eprintln!("  {}", t.host);
+                }
+            }
+            std::process::exit(1);
+        }
+        Err(e) => eprintln!("Error: {}", e),
+    }
+}
+
+fn cmd_forward_stop_all(path: &Path) {
+    match forward::stop_all(path) {
+        Ok(0) => println!("No active tunnels."),
+        Ok(n) => println!("Stopped {} tunnel(s).", n),
+        Err(e) => eprintln!("Error: {}", e),
     }
 }
 
@@ -649,6 +779,24 @@ enum TuiScreen {
     HostsDetail(usize),
     HostsAddForm,
     HostsEditForm(usize),
+    ForwardHostSelect,
+    ForwardList,
+    ForwardAddForm,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SortMode {
+    Name,
+    LastUsed,
+}
+
+impl SortMode {
+    fn label(self) -> &'static str {
+        match self {
+            SortMode::Name => "name",
+            SortMode::LastUsed => "last used",
+        }
+    }
 }
 
 enum PopupKind {
@@ -671,6 +819,11 @@ struct TuiApp {
     hosts_file: HostsFile,
     ssh_path: PathBuf,
     hosts_path: PathBuf,
+    forward_state: ForwardState,
+    forward_state_path: PathBuf,
+    pending_rules: Vec<ForwardRule>,
+    last_forward_check: Option<Instant>,
+    sort_mode: SortMode,
     selected: usize,
     status: Option<String>,
     status_expires_at: Option<Instant>,
@@ -686,6 +839,8 @@ impl TuiApp {
     fn new(ssh_path: &Path, hosts_path: &Path, init: Option<InitScreen>) -> Self {
         let ssh = read_file(ssh_path).unwrap_or_default();
         let hosts = read_file(hosts_path).unwrap_or_default();
+        let forward_state_path = forward::state_path();
+        let forward_state = forward::active(&forward_state_path);
         let mut app = TuiApp {
             screen: TuiScreen::MainMenu,
             nav_stack: Vec::new(),
@@ -693,6 +848,11 @@ impl TuiApp {
             hosts_file: HostsFile::parse(&hosts),
             ssh_path: ssh_path.to_path_buf(),
             hosts_path: hosts_path.to_path_buf(),
+            forward_state,
+            forward_state_path,
+            pending_rules: Vec::new(),
+            last_forward_check: None,
+            sort_mode: SortMode::Name,
             selected: 0,
             status: None,
             status_expires_at: None,
@@ -727,6 +887,7 @@ impl TuiApp {
         let h = read_file(&self.hosts_path).unwrap_or_default();
         self.ssh_config = SshConfig::parse(&s);
         self.hosts_file = HostsFile::parse(&h);
+        self.forward_state = forward::active(&self.forward_state_path);
     }
 
     fn navigate_to(&mut self, screen: TuiScreen, selected: usize) {
@@ -894,6 +1055,195 @@ impl TuiApp {
         }
     }
 
+    // ── Forwards ─────────────────────────────────────────
+
+    fn setup_forward_add_form(&mut self) {
+        self.form_fields = vec![
+            ("Host".into(), String::new()),
+            ("Local Port".into(), String::new()),
+            ("Target Host".into(), String::new()),
+            ("Target Port".into(), String::new()),
+            ("Add Rule".into(), String::new()),
+            ("Save".into(), String::new()),
+            ("Cancel".into(), String::new()),
+        ];
+        self.pending_rules.clear();
+        self.form_focus = 0;
+        self.form_edit_active = false;
+        self.form_edit_buffer = String::new();
+    }
+
+    fn forward_host_options(&self) -> Vec<String> {
+        let mut hosts: Vec<String> = self
+            .ssh_config
+            .hosts()
+            .iter()
+            .flat_map(|host| host.patterns.iter())
+            .filter(|pattern| !pattern.contains('*') && !pattern.contains('?'))
+            .filter(|pattern| !pattern.starts_with('!'))
+            .cloned()
+            .collect();
+        hosts.sort();
+        hosts
+    }
+
+    fn ssh_display_indices(&self) -> Vec<usize> {
+        let hosts = self.ssh_config.hosts();
+        let mut indices: Vec<usize> = (0..hosts.len()).collect();
+        indices.sort_by(|left, right| {
+            let left_host = &hosts[*left];
+            let right_host = &hosts[*right];
+            match self.sort_mode {
+                SortMode::Name => left_host
+                    .patterns
+                    .join(" ")
+                    .cmp(&right_host.patterns.join(" ")),
+                SortMode::LastUsed => self
+                    .host_last_used(left_host)
+                    .cmp(&self.host_last_used(right_host))
+                    .reverse()
+                    .then_with(|| {
+                        left_host
+                            .patterns
+                            .join(" ")
+                            .cmp(&right_host.patterns.join(" "))
+                    }),
+            }
+        });
+        indices
+    }
+
+    fn host_last_used(&self, host: &guajara::ssh::SshHost) -> u64 {
+        host.patterns
+            .iter()
+            .filter_map(|pattern| self.forward_state.last_used.get(pattern).copied())
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn forward_display_indices(&self) -> Vec<usize> {
+        let mut indices: Vec<usize> = (0..self.forward_state.tunnels.len()).collect();
+        indices.sort_by(|left, right| {
+            let left_tunnel = &self.forward_state.tunnels[*left];
+            let right_tunnel = &self.forward_state.tunnels[*right];
+            match self.sort_mode {
+                SortMode::Name => left_tunnel.host.cmp(&right_tunnel.host),
+                SortMode::LastUsed => right_tunnel
+                    .started_at
+                    .cmp(&left_tunnel.started_at)
+                    .then_with(|| left_tunnel.host.cmp(&right_tunnel.host)),
+            }
+        });
+        indices
+    }
+
+    fn toggle_sort_mode(&mut self) {
+        self.sort_mode = match self.sort_mode {
+            SortMode::Name => SortMode::LastUsed,
+            SortMode::LastUsed => SortMode::Name,
+        };
+        self.set_status(format!("Sort: {}", self.sort_mode.label()));
+    }
+
+    fn setup_forward_form_for_host(&mut self, host: &str) {
+        self.setup_forward_add_form();
+        self.form_fields[0].1 = host.to_string();
+    }
+
+    fn add_pending_rule(&mut self) -> Option<String> {
+        let host = self.form_fields[0].1.trim().to_string();
+        let local_port: u16 = self.form_fields[1].1.trim().parse().unwrap_or(0);
+        let target_host = self.form_fields[2].1.trim().to_string();
+        let target_port: u16 = self.form_fields[3].1.trim().parse().unwrap_or(0);
+        if host.is_empty() {
+            return Some("Host field is required".to_string());
+        }
+        if local_port == 0 {
+            return Some("Local port must be between 1 and 65535".to_string());
+        }
+        if target_host.is_empty() {
+            return Some("Target host is required".to_string());
+        }
+        if target_port == 0 {
+            return Some("Target port must be between 1 and 65535".to_string());
+        }
+        let mut all = self.pending_rules.clone();
+        all.push(ForwardRule {
+            host,
+            local_port,
+            target_host,
+            target_port,
+        });
+        if let Err(e) = forward::validate_start(&self.forward_state_path, &all) {
+            return Some(e);
+        }
+        self.pending_rules = all;
+        self.form_fields[0].1.clear();
+        self.form_fields[1].1.clear();
+        self.form_fields[2].1.clear();
+        self.form_fields[3].1.clear();
+        self.set_status(format!(
+            "1 rule queued — {} total",
+            self.pending_rules.len()
+        ));
+        None
+    }
+
+    fn save_forwards(&mut self) -> Option<String> {
+        if self.pending_rules.is_empty() {
+            return Some("Add at least one rule before saving".to_string());
+        }
+        match forward::start_all(&self.forward_state_path, &self.pending_rules) {
+            Ok(tunnels) => {
+                let summary = tunnels
+                    .iter()
+                    .map(|t| {
+                        let rules = t
+                            .rules
+                            .iter()
+                            .map(|r| r.describe())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!("  {}: {}", t.host, rules)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.pending_rules.clear();
+                self.forward_state = forward::active(&self.forward_state_path);
+                self.show_popup(
+                    PopupKind::Success,
+                    "Tunnels started".into(),
+                    format!("{} tunnel(s) up:\n{}", tunnels.len(), summary),
+                );
+                None
+            }
+            Err(e) => Some(e),
+        }
+    }
+
+    fn stop_selected_tunnel(&mut self) {
+        let Some(&index) = self.forward_display_indices().get(self.selected) else {
+            return;
+        };
+        let Some(tunnel) = self.forward_state.tunnels.get(index).cloned() else {
+            return;
+        };
+        match forward::stop_tunnel(&self.forward_state_path, &tunnel.host) {
+            Ok(_) => {
+                self.forward_state = forward::active(&self.forward_state_path);
+                self.clamp_forward_sel();
+                self.set_status(format!("Stopped tunnel for '{}'", tunnel.host));
+            }
+            Err(e) => self.show_popup(PopupKind::Error, "Error".into(), e),
+        }
+    }
+
+    fn clamp_forward_sel(&mut self) {
+        self.selected = self
+            .selected
+            .min(self.forward_state.tunnels.len().saturating_sub(1));
+    }
+
     // ── Form setup ──────────────────────────────────────
 
     fn setup_ssh_add_form(&mut self) {
@@ -1049,6 +1399,7 @@ fn handle_tui_key(app: &mut TuiApp, key: event::KeyEvent) {
             | TuiScreen::SshEditForm(_)
             | TuiScreen::HostsAddForm
             | TuiScreen::HostsEditForm(_)
+            | TuiScreen::ForwardAddForm
     ) {
         handle_form_key(app, key);
         return;
@@ -1065,18 +1416,22 @@ fn handle_tui_key(app: &mut TuiApp, key: event::KeyEvent) {
         }
         KeyCode::Char('j') | KeyCode::Down => {
             let n = match app.screen {
-                TuiScreen::MainMenu => 4,
+                TuiScreen::MainMenu => 5,
                 TuiScreen::SshList => app.ssh_config.hosts().len().max(1),
                 TuiScreen::HostsList => app.hosts_file.records().len().max(1),
+                TuiScreen::ForwardHostSelect => app.forward_host_options().len().max(1),
+                TuiScreen::ForwardList => app.forward_state.tunnels.len().max(1),
                 _ => 1,
             };
             app.selected = (app.selected + 1) % n;
         }
         KeyCode::Char('k') | KeyCode::Up => {
             let n = match app.screen {
-                TuiScreen::MainMenu => 4,
+                TuiScreen::MainMenu => 5,
                 TuiScreen::SshList => app.ssh_config.hosts().len().max(1),
                 TuiScreen::HostsList => app.hosts_file.records().len().max(1),
+                TuiScreen::ForwardHostSelect => app.forward_host_options().len().max(1),
+                TuiScreen::ForwardList => app.forward_state.tunnels.len().max(1),
                 _ => 1,
             };
             app.selected = if app.selected == 0 {
@@ -1090,6 +1445,11 @@ fn handle_tui_key(app: &mut TuiApp, key: event::KeyEvent) {
                 0 => app.navigate_to(TuiScreen::SshList, 0),
                 1 => app.navigate_to(TuiScreen::HostsList, 0),
                 2 => {
+                    let state = forward::active(&app.forward_state_path);
+                    app.forward_state = state;
+                    app.navigate_to(TuiScreen::ForwardList, 0);
+                }
+                3 => {
                     let mut parts = Vec::new();
                     let se = app.ssh_config.validate();
                     let he = app.hosts_file.validate();
@@ -1118,12 +1478,12 @@ fn handle_tui_key(app: &mut TuiApp, key: event::KeyEvent) {
                     }
                     app.show_popup(PopupKind::Info, "Validation".into(), msg);
                 }
-                3 => app.should_quit = true,
+                4 => app.should_quit = true,
                 _ => {}
             },
             TuiScreen::SshList => {
-                let idx = app.selected;
-                if idx < app.ssh_config.hosts().len() {
+                let indices = app.ssh_display_indices();
+                if let Some(&idx) = indices.get(app.selected) {
                     app.navigate_to(TuiScreen::SshDetail(idx), 0);
                 }
             }
@@ -1131,6 +1491,14 @@ fn handle_tui_key(app: &mut TuiApp, key: event::KeyEvent) {
                 let idx = app.selected;
                 if idx < app.hosts_file.records().len() {
                     app.navigate_to(TuiScreen::HostsDetail(idx), 0);
+                }
+            }
+            TuiScreen::ForwardHostSelect => {
+                let hosts = app.forward_host_options();
+                if let Some(host) = hosts.get(app.selected) {
+                    let host = host.clone();
+                    app.setup_forward_form_for_host(&host);
+                    app.navigate_to(TuiScreen::ForwardAddForm, 0);
                 }
             }
             _ => {}
@@ -1146,13 +1514,26 @@ fn handle_tui_key(app: &mut TuiApp, key: event::KeyEvent) {
                 app.setup_hosts_add_form();
                 app.navigate_to(TuiScreen::HostsAddForm, sel);
             }
+            TuiScreen::ForwardList => {
+                let sel = app.selected;
+                if app.forward_host_options().is_empty() {
+                    app.show_popup(
+                        PopupKind::Info,
+                        "No SSH hosts".into(),
+                        "Add a host in Manage SSH hosts first.".into(),
+                    );
+                } else {
+                    app.navigate_to(TuiScreen::ForwardHostSelect, sel);
+                }
+            }
             _ => {}
         },
         KeyCode::Char('e') => match app.screen {
             TuiScreen::SshList if app.selected < app.ssh_config.hosts().len() => {
-                let idx = app.selected;
-                app.setup_ssh_edit_form(idx);
-                app.navigate_to(TuiScreen::SshEditForm(idx), idx);
+                if let Some(&idx) = app.ssh_display_indices().get(app.selected) {
+                    app.setup_ssh_edit_form(idx);
+                    app.navigate_to(TuiScreen::SshEditForm(idx), app.selected);
+                }
             }
             TuiScreen::HostsList if app.selected < app.hosts_file.records().len() => {
                 let idx = app.selected;
@@ -1163,12 +1544,13 @@ fn handle_tui_key(app: &mut TuiApp, key: event::KeyEvent) {
         },
         KeyCode::Char('d') => match app.screen {
             TuiScreen::SshList if app.selected < app.ssh_config.hosts().len() => {
-                let p = app.ssh_config.hosts()[app.selected].patterns.join(" ");
-                let _ = app
-                    .ssh_config
-                    .remove_block(app.ssh_config.hosts()[app.selected].start_idx);
-                app.set_status(format!("Removed '{}' — save with s", p));
-                app.clamp_ssh_sel();
+                if let Some(&idx) = app.ssh_display_indices().get(app.selected) {
+                    let p = app.ssh_config.hosts()[idx].patterns.join(" ");
+                    let start = app.ssh_config.hosts()[idx].start_idx;
+                    let _ = app.ssh_config.remove_block(start);
+                    app.set_status(format!("Removed '{}' — save with s", p));
+                    app.clamp_ssh_sel();
+                }
             }
             TuiScreen::HostsList if app.selected < app.hosts_file.records().len() => {
                 let e = app.hosts_file.records()[app.selected].hostnames.join(" ");
@@ -1178,6 +1560,20 @@ fn handle_tui_key(app: &mut TuiApp, key: event::KeyEvent) {
             }
             _ => {}
         },
+        KeyCode::Char('x') => {
+            if app.screen == TuiScreen::ForwardList {
+                app.stop_selected_tunnel();
+            }
+        }
+        KeyCode::Char('o') => match app.screen {
+            TuiScreen::SshList | TuiScreen::ForwardList => app.toggle_sort_mode(),
+            _ => {}
+        },
+        KeyCode::Char('n') => {
+            if app.screen == TuiScreen::ForwardHostSelect {
+                app.navigate_to(TuiScreen::SshList, 0);
+            }
+        }
         KeyCode::Char('s') => match app.screen {
             TuiScreen::SshList => {
                 if let Some(e) = app.save_ssh() {
@@ -1246,24 +1642,39 @@ fn handle_form_key(app: &mut TuiApp, key: event::KeyEvent) {
             };
         }
         KeyCode::Enter => {
-            let label = &app.form_fields[app.form_focus].0;
-            if label == "Save" {
-                let err = match app.screen {
-                    TuiScreen::SshAddForm | TuiScreen::SshEditForm(_) => app.save_ssh(),
-                    _ => app.save_hosts(),
-                };
-                if let Some(e) = err {
-                    app.show_popup(PopupKind::Error, "Error".into(), e);
-                } else {
-                    app.set_status("Saved".to_string());
-                    app.go_back();
-                    app.reload();
+            let label = app.form_fields[app.form_focus].0.clone();
+            match label.as_str() {
+                "Save" => {
+                    let err = match app.screen {
+                        TuiScreen::SshAddForm | TuiScreen::SshEditForm(_) => app.save_ssh(),
+                        TuiScreen::ForwardAddForm => app.save_forwards(),
+                        _ => app.save_hosts(),
+                    };
+                    match err {
+                        Some(e) => app.show_popup(PopupKind::Error, "Error".into(), e),
+                        None if matches!(app.screen, TuiScreen::ForwardAddForm) => {
+                            app.set_status("Tunnels started".to_string());
+                            app.go_back();
+                        }
+                        None => {
+                            app.set_status("Saved".to_string());
+                            app.go_back();
+                            app.reload();
+                        }
+                    }
                 }
-            } else if label == "Cancel" {
-                app.go_back();
-            } else {
-                app.form_edit_buffer = app.form_fields[app.form_focus].1.clone();
-                app.form_edit_active = true;
+                "Cancel" => {
+                    app.go_back();
+                }
+                "Add Rule" => {
+                    if let Some(e) = app.add_pending_rule() {
+                        app.show_popup(PopupKind::Error, "Error".into(), e);
+                    }
+                }
+                _ => {
+                    app.form_edit_buffer = app.form_fields[app.form_focus].1.clone();
+                    app.form_edit_active = true;
+                }
             }
         }
         _ => {}
@@ -1323,6 +1734,19 @@ fn render_tui(frame: &mut Frame, app: &mut TuiApp) {
         app.status_expires_at = None;
     }
 
+    // Periodically re-check tunnel liveness on the forwards screen
+    if matches!(app.screen, TuiScreen::ForwardList) {
+        let should_refresh = app
+            .last_forward_check
+            .map(|t| t.elapsed() >= Duration::from_secs(2))
+            .unwrap_or(true);
+        if should_refresh {
+            app.forward_state = forward::active(&app.forward_state_path);
+            app.clamp_forward_sel();
+            app.last_forward_check = Some(Instant::now());
+        }
+    }
+
     // Auto-dismiss expired popups
     if let Some(ref popup) = app.popup
         && let Some(expires) = popup.expires_at
@@ -1364,6 +1788,9 @@ fn render_tui(frame: &mut Frame, app: &mut TuiApp) {
                 TuiScreen::HostsDetail(_) => "Hosts Details",
                 TuiScreen::HostsAddForm => "Add Hosts Entry",
                 TuiScreen::HostsEditForm(_) => "Edit Hosts Entry",
+                TuiScreen::ForwardHostSelect => "Select SSH Host",
+                TuiScreen::ForwardList => "Port Forwards",
+                TuiScreen::ForwardAddForm => "Add Port Forwards",
             },
             Style::default().fg(Color::Yellow),
         ),
@@ -1378,16 +1805,29 @@ fn render_tui(frame: &mut Frame, app: &mut TuiApp) {
         TuiScreen::HostsList => render_hosts_list(frame, lo[1], app),
         TuiScreen::HostsDetail(idx) => render_hosts_detail(frame, lo[1], app, idx),
         TuiScreen::HostsAddForm | TuiScreen::HostsEditForm(_) => render_form(frame, lo[1], app),
+        TuiScreen::ForwardHostSelect => render_forward_host_select(frame, lo[1], app),
+        TuiScreen::ForwardList => render_forward_list(frame, lo[1], app),
+        TuiScreen::ForwardAddForm => render_form(frame, lo[1], app),
     }
 
     let st = app.status.clone().unwrap_or_else(|| match app.screen {
         TuiScreen::MainMenu => "up/down nav  enter select  r reload  q quit".into(),
         TuiScreen::SshList => {
-            "j/k nav  enter view  a add  e edit  d delete  s save  r reload  Esc back".into()
+            format!(
+                "j/k nav  o sort:{}  enter view  a add  e edit  d delete  s save  r reload  Esc back",
+                app.sort_mode.label()
+            )
         }
         TuiScreen::HostsList => {
             "j/k nav  enter view  a add  e edit  d delete  s save  r reload  Esc back".into()
         }
+        TuiScreen::ForwardList => {
+            format!(
+                "j/k nav  o sort:{}  a add forwards  x stop tunnel  r refresh  Esc back",
+                app.sort_mode.label()
+            )
+        }
+        TuiScreen::ForwardHostSelect => "j/k nav  Enter select  n add SSH host  Esc back".into(),
         TuiScreen::SshDetail(_) | TuiScreen::HostsDetail(_) => "Esc back  r reload".into(),
         _ if app.form_edit_active => "Enter confirm  Esc cancel  typing".into(),
         _ => "up/down field  enter edit / save / cancel  Esc back".into(),
@@ -1410,6 +1850,7 @@ fn render_main_menu(frame: &mut Frame, area: Rect, app: &mut TuiApp) {
     let items = [
         "Manage SSH hosts",
         "Manage /etc/hosts entries",
+        "Port forwards",
         "Validate both files",
         "Quit",
     ];
@@ -1448,10 +1889,12 @@ fn render_ssh_list(frame: &mut Frame, area: Rect, app: &mut TuiApp) {
         );
         return;
     }
-    let li: Vec<ListItem> = hosts
-        .iter()
+    let li: Vec<ListItem> = app
+        .ssh_display_indices()
+        .into_iter()
         .enumerate()
-        .map(|(i, h)| {
+        .map(|(i, index)| {
+            let h = &hosts[index];
             let s = if i == app.selected {
                 Style::default().fg(Color::Black).bg(Color::Cyan)
             } else {
@@ -1609,19 +2052,118 @@ fn render_hosts_detail(frame: &mut Frame, area: Rect, app: &mut TuiApp, idx: usi
     );
 }
 
+fn render_forward_list(frame: &mut Frame, area: Rect, app: &mut TuiApp) {
+    let tunnels = &app.forward_state.tunnels;
+    if tunnels.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No active tunnels.\n\nPress 'a' to add port forwards.").block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Port Forwards "),
+            ),
+            area,
+        );
+        return;
+    }
+    let li: Vec<ListItem> = app
+        .forward_display_indices()
+        .into_iter()
+        .enumerate()
+        .map(|(i, index)| {
+            let t = &tunnels[index];
+            let s = if i == app.selected {
+                Style::default().fg(Color::Black).bg(Color::Green)
+            } else {
+                Style::default()
+            };
+            let rules = t
+                .rules
+                .iter()
+                .map(|r| r.describe())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Line::from(vec![
+                Span::styled(
+                    format!(
+                        "{}{:<16} pid:{:<8}",
+                        if i == app.selected { "> " } else { "  " },
+                        t.host,
+                        t.pid
+                    ),
+                    s,
+                ),
+                Span::styled("UP ", Style::default().fg(Color::Green)),
+                Span::styled(rules, s),
+            ])
+            .into()
+        })
+        .collect();
+    frame.render_widget(
+        List::new(li).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Port Forwards "),
+        ),
+        area,
+    );
+}
+
+fn render_forward_host_select(frame: &mut Frame, area: Rect, app: &mut TuiApp) {
+    let hosts = app.forward_host_options();
+    if hosts.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No SSH hosts configured.\n\nPress 'n' to add one.").block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Select SSH Host "),
+            ),
+            area,
+        );
+        return;
+    }
+    let items: Vec<ListItem> = hosts
+        .iter()
+        .enumerate()
+        .map(|(index, host)| {
+            let style = if index == app.selected {
+                Style::default().fg(Color::Black).bg(Color::Cyan)
+            } else {
+                Style::default()
+            };
+            ListItem::new(Line::from(Span::styled(
+                format!(
+                    "{}{}",
+                    if index == app.selected { "> " } else { "  " },
+                    host
+                ),
+                style,
+            )))
+        })
+        .collect();
+    frame.render_widget(
+        List::new(items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Select SSH Host "),
+        ),
+        area,
+    );
+}
+
 fn render_form(frame: &mut Frame, area: Rect, app: &mut TuiApp) {
     let title = match app.screen {
         TuiScreen::SshAddForm => " Add SSH Host ",
         TuiScreen::SshEditForm(_) => " Edit SSH Host ",
         TuiScreen::HostsAddForm => " Add Hosts Entry ",
         TuiScreen::HostsEditForm(_) => " Edit Hosts Entry ",
+        TuiScreen::ForwardAddForm => " Add Port Forwards ",
         _ => " Form ",
     };
 
     let mut lines = Vec::new();
     for (i, (label, val)) in app.form_fields.iter().enumerate() {
         let focused = i == app.form_focus;
-        let action = label == "Save" || label == "Cancel";
+        let action = label == "Save" || label == "Cancel" || label == "Add Rule";
         let display = if action {
             format!("  [ {} ]{}", label, if focused { " <" } else { "" })
         } else if focused && app.form_edit_active {
@@ -1641,6 +2183,27 @@ fn render_form(frame: &mut Frame, area: Rect, app: &mut TuiApp) {
         lines.push(Line::from(Span::styled(display, st)));
     }
 
+    if matches!(app.screen, TuiScreen::ForwardAddForm) {
+        if app.pending_rules.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  No rules queued — fill the fields above and press Enter on Add Rule",
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else {
+            lines.push(Line::from(Span::styled(
+                "  Pending rules:",
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+            for r in &app.pending_rules {
+                lines.push(Line::from(Span::raw(format!(
+                    "    [{}] {}",
+                    r.host,
+                    r.describe()
+                ))));
+            }
+        }
+    }
+
     frame.render_widget(
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)),
         area,
@@ -1651,13 +2214,17 @@ fn render_form(frame: &mut Frame, area: Rect, app: &mut TuiApp) {
 mod tests {
     use super::*;
     use crossterm::event::KeyEvent;
+    use guajara::forward::Tunnel;
 
     fn test_app() -> TuiApp {
-        TuiApp::new(
-            &Path::new("/nonexistent/__guajara_test_ssh"),
-            &Path::new("/nonexistent/__guajara_test_hosts"),
+        let mut app = TuiApp::new(
+            Path::new("/nonexistent/__guajara_test_ssh"),
+            Path::new("/nonexistent/__guajara_test_hosts"),
             None,
-        )
+        );
+        app.forward_state = ForwardState::default();
+        app.forward_state_path = PathBuf::from("/nonexistent/__guajara_test_forwards");
+        app
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -1937,8 +2504,8 @@ mod tests {
     #[test]
     fn test_cli_init_ssh_edit_has_parent_stack() {
         let app = TuiApp::new(
-            &Path::new("/nonexistent/__guajara_test_ssh"),
-            &Path::new("/nonexistent/__guajara_test_hosts"),
+            Path::new("/nonexistent/__guajara_test_ssh"),
+            Path::new("/nonexistent/__guajara_test_hosts"),
             Some(InitScreen::SshEdit(5)),
         );
         assert_eq!(app.screen, TuiScreen::SshEditForm(5));
@@ -1949,8 +2516,8 @@ mod tests {
     #[test]
     fn test_cli_init_hosts_edit_has_parent_stack() {
         let app = TuiApp::new(
-            &Path::new("/nonexistent/__guajara_test_ssh"),
-            &Path::new("/nonexistent/__guajara_test_hosts"),
+            Path::new("/nonexistent/__guajara_test_ssh"),
+            Path::new("/nonexistent/__guajara_test_hosts"),
             Some(InitScreen::HostsEdit(3)),
         );
         assert_eq!(app.screen, TuiScreen::HostsEditForm(3));
@@ -1961,8 +2528,8 @@ mod tests {
     #[test]
     fn test_cli_init_ssh_edit_esc_returns_to_list() {
         let mut app = TuiApp::new(
-            &Path::new("/nonexistent/__guajara_test_ssh"),
-            &Path::new("/nonexistent/__guajara_test_hosts"),
+            Path::new("/nonexistent/__guajara_test_ssh"),
+            Path::new("/nonexistent/__guajara_test_hosts"),
             Some(InitScreen::SshEdit(5)),
         );
         handle_tui_key(&mut app, key(KeyCode::Esc));
@@ -1980,10 +2547,8 @@ mod tests {
         app.navigate_to(TuiScreen::SshDetail(42), 0);
         // Simulate what render_ssh_detail does
         let hosts = app.ssh_config.hosts();
-        if 42 >= hosts.len() {
-            if !app.go_back() {
-                app.screen = TuiScreen::SshList;
-            }
+        if 42 >= hosts.len() && !app.go_back() {
+            app.screen = TuiScreen::SshList;
         }
         assert_eq!(app.screen, TuiScreen::SshList);
         assert_eq!(stack_len(&app), 1);
@@ -1998,12 +2563,418 @@ mod tests {
         // Set up without stack entry (shouldn't happen but tests fallback)
         app.screen = TuiScreen::HostsDetail(99);
         let records = app.hosts_file.records();
-        if 99 >= records.len() {
-            if !app.go_back() {
-                app.screen = TuiScreen::HostsList;
-            }
+        if 99 >= records.len() && !app.go_back() {
+            app.screen = TuiScreen::HostsList;
         }
         assert_eq!(app.screen, TuiScreen::HostsList);
+    }
+
+    // ── Forward TUI ────────────────────────────────────────
+
+    fn fake_tunnel(host: &str, pid: u32, local_port: u16) -> Tunnel {
+        Tunnel {
+            host: host.to_string(),
+            pid,
+            started_at: 0,
+            rules: vec![ForwardRule {
+                host: host.to_string(),
+                local_port,
+                target_host: "db.internal".to_string(),
+                target_port: local_port,
+            }],
+            managed: true,
+        }
+    }
+
+    #[test]
+    fn test_enter_on_main_menu_forwards_navigates() {
+        let mut app = test_app();
+        app.selected = 2;
+
+        handle_tui_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(app.screen, TuiScreen::ForwardList);
+        assert_eq!(app.selected, 0);
+        assert_eq!(stack_len(&app), 1);
+    }
+
+    #[test]
+    fn test_forward_add_opens_registered_host_selector() {
+        let mut app = test_app();
+        app.ssh_config = SshConfig::parse(
+            "Host production staging\n    HostName example.internal\n\nHost *.internal\n",
+        );
+        app.selected = 2;
+        handle_tui_key(&mut app, key(KeyCode::Enter));
+        handle_tui_key(&mut app, key(KeyCode::Char('a')));
+        assert_eq!(app.screen, TuiScreen::ForwardHostSelect);
+        assert_eq!(app.forward_host_options(), vec!["production", "staging"]);
+    }
+
+    #[test]
+    fn test_forward_host_selector_copies_selected_alias_to_form() {
+        let mut app = test_app();
+        app.ssh_config = SshConfig::parse("Host production\n    HostName example.internal\n");
+        app.navigate_to(TuiScreen::ForwardHostSelect, 0);
+
+        handle_tui_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(app.screen, TuiScreen::ForwardAddForm);
+        assert_eq!(
+            app.form_fields[0],
+            ("Host".to_string(), "production".to_string())
+        );
+    }
+
+    #[test]
+    fn test_forward_host_selector_can_open_ssh_host_manager() {
+        let mut app = test_app();
+        app.ssh_config = SshConfig::parse("Host production\n    HostName example.internal\n");
+        app.navigate_to(TuiScreen::ForwardHostSelect, 0);
+
+        handle_tui_key(&mut app, key(KeyCode::Char('n')));
+        assert_eq!(app.screen, TuiScreen::SshList);
+        assert_eq!(stack_len(&app), 2);
+    }
+
+    #[test]
+    fn test_ssh_hosts_are_sorted_by_name_by_default() {
+        let mut app = test_app();
+        app.ssh_config = SshConfig::parse(
+            "Host zebra\n    HostName zebra.internal\n\nHost alpha\n    HostName alpha.internal\n",
+        );
+
+        let indices = app.ssh_display_indices();
+        let hosts = app.ssh_config.hosts();
+        assert_eq!(hosts[indices[0]].patterns[0], "alpha");
+        assert_eq!(hosts[indices[1]].patterns[0], "zebra");
+    }
+
+    #[test]
+    fn test_ssh_hosts_can_be_sorted_by_last_used_forward() {
+        let mut app = test_app();
+        app.ssh_config = SshConfig::parse(
+            "Host zebra\n    HostName zebra.internal\n\nHost alpha\n    HostName alpha.internal\n",
+        );
+        app.forward_state.last_used.insert("zebra".into(), 10);
+        app.forward_state.last_used.insert("alpha".into(), 20);
+        app.toggle_sort_mode();
+
+        let indices = app.ssh_display_indices();
+        let hosts = app.ssh_config.hosts();
+        assert_eq!(hosts[indices[0]].patterns[0], "alpha");
+        assert_eq!(hosts[indices[1]].patterns[0], "zebra");
+        assert_eq!(app.sort_mode, SortMode::LastUsed);
+    }
+
+    #[test]
+    fn test_forward_tunnels_are_sorted_by_name_by_default() {
+        let mut app = test_app();
+        app.forward_state.tunnels = vec![
+            fake_tunnel("zebra", std::process::id(), 5432),
+            fake_tunnel("alpha", std::process::id(), 5433),
+        ];
+
+        let indices = app.forward_display_indices();
+        assert_eq!(app.forward_state.tunnels[indices[0]].host, "alpha");
+        assert_eq!(app.forward_state.tunnels[indices[1]].host, "zebra");
+    }
+
+    #[test]
+    fn test_forward_tunnels_can_be_sorted_by_last_used() {
+        let mut app = test_app();
+        app.forward_state.tunnels = vec![
+            Tunnel {
+                host: "zebra".into(),
+                pid: std::process::id(),
+                started_at: 10,
+                rules: vec![],
+                managed: true,
+            },
+            Tunnel {
+                host: "alpha".into(),
+                pid: std::process::id(),
+                started_at: 20,
+                rules: vec![],
+                managed: true,
+            },
+        ];
+        app.toggle_sort_mode();
+
+        let indices = app.forward_display_indices();
+        assert_eq!(app.forward_state.tunnels[indices[0]].host, "alpha");
+        assert_eq!(app.forward_state.tunnels[indices[1]].host, "zebra");
+    }
+
+    #[test]
+    fn test_main_menu_has_five_items_and_wraps() {
+        let mut app = test_app();
+        for _ in 0..5 {
+            handle_tui_key(&mut app, key(KeyCode::Down));
+        }
+        assert_eq!(app.selected, 0);
+        handle_tui_key(&mut app, key(KeyCode::Up));
+        assert_eq!(app.selected, 4);
+    }
+
+    #[test]
+    fn test_esc_on_forward_list_goes_back_to_menu() {
+        let mut app = test_app();
+        app.selected = 2;
+        handle_tui_key(&mut app, key(KeyCode::Enter));
+        handle_tui_key(&mut app, key(KeyCode::Esc));
+        assert_eq!(app.screen, TuiScreen::MainMenu);
+        assert_eq!(app.selected, 2);
+        assert_eq!(stack_len(&app), 0);
+    }
+
+    #[test]
+    fn test_forward_list_nav_cycles_over_tunnels() {
+        let mut app = test_app();
+        app.forward_state.tunnels = vec![
+            fake_tunnel("a", std::process::id(), 5432),
+            fake_tunnel("b", std::process::id(), 5433),
+            fake_tunnel("c", std::process::id(), 5434),
+        ];
+        app.navigate_to(TuiScreen::ForwardList, 0);
+
+        handle_tui_key(&mut app, key(KeyCode::Down));
+        assert_eq!(app.selected, 1);
+        handle_tui_key(&mut app, key(KeyCode::Down));
+        assert_eq!(app.selected, 2);
+        handle_tui_key(&mut app, key(KeyCode::Down));
+        assert_eq!(app.selected, 0);
+        handle_tui_key(&mut app, key(KeyCode::Up));
+        assert_eq!(app.selected, 2);
+    }
+
+    #[test]
+    fn test_forward_add_rule_queues_pending_rule() {
+        let mut app = test_app();
+        app.navigate_to(TuiScreen::ForwardList, 0);
+        app.setup_forward_add_form();
+        app.navigate_to(TuiScreen::ForwardAddForm, 0);
+        app.form_fields[0].1 = "web1".into();
+        app.form_fields[1].1 = "5432".into();
+        app.form_fields[2].1 = "db.internal".into();
+        app.form_fields[3].1 = "5432".into();
+        app.form_focus = 4; // Add Rule
+
+        handle_form_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(app.pending_rules.len(), 1);
+        assert_eq!(app.pending_rules[0].host, "web1");
+        assert_eq!(app.pending_rules[0].local_port, 5432);
+        // Fields cleared after queuing
+        assert_eq!(app.form_fields[0].1, "");
+        assert_eq!(app.form_fields[1].1, "");
+        assert_eq!(app.form_fields[2].1, "");
+        assert_eq!(app.form_fields[3].1, "");
+        assert!(app.popup.is_none());
+    }
+
+    #[test]
+    fn test_forward_add_rule_rejects_invalid_port() {
+        let mut app = test_app();
+        app.setup_forward_add_form();
+        app.form_fields[0].1 = "web1".into();
+        app.form_fields[1].1 = "not-a-number".into();
+        app.form_fields[2].1 = "db.internal".into();
+        app.form_fields[3].1 = "5432".into();
+        app.form_focus = 4;
+
+        handle_form_key(&mut app, key(KeyCode::Enter));
+        assert!(app.pending_rules.is_empty());
+        assert!(app.popup.is_some());
+    }
+
+    #[test]
+    fn test_forward_add_rule_rejects_zero_port() {
+        let mut app = test_app();
+        app.setup_forward_add_form();
+        app.form_fields[0].1 = "web1".into();
+        app.form_fields[1].1 = "0".into();
+        app.form_fields[2].1 = "db.internal".into();
+        app.form_fields[3].1 = "5432".into();
+        app.form_focus = 4;
+
+        handle_form_key(&mut app, key(KeyCode::Enter));
+        assert!(app.pending_rules.is_empty());
+        assert!(app.popup.is_some());
+    }
+
+    #[test]
+    fn test_forward_add_rule_rejects_duplicate_port_across_hosts() {
+        let mut app = test_app();
+        app.setup_forward_add_form();
+        app.form_fields[0].1 = "web1".into();
+        app.form_fields[1].1 = "5432".into();
+        app.form_fields[2].1 = "db.internal".into();
+        app.form_fields[3].1 = "5432".into();
+        app.form_focus = 4;
+        handle_form_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(app.pending_rules.len(), 1);
+
+        app.form_fields[0].1 = "web2".into();
+        handle_form_key(&mut app, key(KeyCode::Enter));
+        assert!(app.popup.is_some());
+        assert_eq!(app.pending_rules.len(), 1);
+    }
+
+    #[test]
+    fn test_forward_add_rule_allows_second_rule_same_host_different_port() {
+        let mut app = test_app();
+        app.setup_forward_add_form();
+        app.form_fields[0].1 = "web1".into();
+        app.form_fields[1].1 = "5432".into();
+        app.form_fields[2].1 = "db.internal".into();
+        app.form_fields[3].1 = "5432".into();
+        app.form_focus = 4;
+        handle_form_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(app.pending_rules.len(), 1);
+
+        app.form_fields[0].1 = "web1".into();
+        app.form_fields[1].1 = "8080".into();
+        app.form_fields[2].1 = "web".into();
+        app.form_fields[3].1 = "80".into();
+        handle_form_key(&mut app, key(KeyCode::Enter));
+        assert!(app.popup.is_none());
+        assert_eq!(app.pending_rules.len(), 2);
+    }
+
+    #[test]
+    fn test_form_forward_save_with_no_rules_shows_error() {
+        let mut app = test_app();
+        app.navigate_to(TuiScreen::ForwardList, 0);
+        app.setup_forward_add_form();
+        app.navigate_to(TuiScreen::ForwardAddForm, 0);
+        app.form_focus = 5; // Save
+
+        handle_form_key(&mut app, key(KeyCode::Enter));
+        assert!(app.popup.is_some());
+        assert_eq!(app.screen, TuiScreen::ForwardAddForm);
+        assert_eq!(stack_len(&app), 2);
+    }
+
+    #[test]
+    fn test_forward_add_form_cancel_uses_stack() {
+        let mut app = test_app();
+        app.navigate_to(TuiScreen::ForwardList, 1);
+        app.setup_forward_add_form();
+        app.navigate_to(TuiScreen::ForwardAddForm, 1);
+        app.form_focus = 6; // Cancel
+
+        handle_form_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(app.screen, TuiScreen::ForwardList);
+        assert_eq!(app.selected, 1);
+        assert_eq!(stack_len(&app), 1);
+    }
+
+    #[test]
+    fn test_stop_selected_tunnel_with_dead_pid_prunes_state() {
+        let mut app = test_app();
+        app.forward_state.tunnels = vec![fake_tunnel("ghost", 4_000_000_000, 5432)];
+        app.navigate_to(TuiScreen::ForwardList, 0);
+
+        handle_tui_key(&mut app, key(KeyCode::Char('x')));
+        assert!(app.forward_state.tunnels.is_empty());
+        assert!(app.status.is_some());
+    }
+
+    #[test]
+    fn test_stop_selected_tunnel_clamps_selection() {
+        let mut app = test_app();
+        app.forward_state.tunnels = vec![
+            fake_tunnel("a", 4_000_000_000, 5432),
+            fake_tunnel("b", 4_000_000_001, 5433),
+        ];
+        app.navigate_to(TuiScreen::ForwardList, 1);
+
+        handle_tui_key(&mut app, key(KeyCode::Char('x')));
+        assert!(app.forward_state.tunnels.is_empty());
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn test_popup_on_forward_list_dismisses_without_nav() {
+        let mut app = test_app();
+        app.navigate_to(TuiScreen::ForwardList, 0);
+        app.show_popup(PopupKind::Info, "t".into(), "m".into());
+
+        handle_tui_key(&mut app, key(KeyCode::Esc));
+        assert!(app.popup.is_none());
+        assert_eq!(app.screen, TuiScreen::ForwardList);
+        assert_eq!(stack_len(&app), 1);
+    }
+
+    #[test]
+    fn test_enter_on_forward_list_is_noop() {
+        let mut app = test_app();
+        app.forward_state.tunnels = vec![fake_tunnel("a", std::process::id(), 5432)];
+        app.navigate_to(TuiScreen::ForwardList, 0);
+
+        handle_tui_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(app.screen, TuiScreen::ForwardList);
+        assert_eq!(stack_len(&app), 1);
+    }
+
+    #[test]
+    fn test_forward_add_rule_trims_input() {
+        let mut app = test_app();
+        app.setup_forward_add_form();
+        app.form_fields[0].1 = "  web1  ".into();
+        app.form_fields[1].1 = " 5432 ".into();
+        app.form_fields[2].1 = " db.internal ".into();
+        app.form_fields[3].1 = " 5432 ".into();
+        app.form_focus = 4;
+
+        handle_form_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(app.pending_rules.len(), 1);
+        assert_eq!(app.pending_rules[0].host, "web1");
+        assert_eq!(app.pending_rules[0].target_host, "db.internal");
+        assert_eq!(app.pending_rules[0].local_port, 5432);
+    }
+
+    #[test]
+    fn test_forward_add_rule_rejects_port_above_65535() {
+        let mut app = test_app();
+        app.setup_forward_add_form();
+        app.form_fields[0].1 = "web1".into();
+        app.form_fields[1].1 = "99999".into();
+        app.form_fields[2].1 = "db.internal".into();
+        app.form_fields[3].1 = "5432".into();
+        app.form_focus = 4;
+
+        handle_form_key(&mut app, key(KeyCode::Enter));
+        assert!(app.pending_rules.is_empty());
+        assert!(app.popup.is_some());
+    }
+
+    #[test]
+    fn test_forward_add_rule_rejects_whitespace_only_host() {
+        let mut app = test_app();
+        app.setup_forward_add_form();
+        app.form_fields[0].1 = "   ".into();
+        app.form_fields[1].1 = "5432".into();
+        app.form_fields[2].1 = "db.internal".into();
+        app.form_fields[3].1 = "5432".into();
+        app.form_focus = 4;
+
+        handle_form_key(&mut app, key(KeyCode::Enter));
+        assert!(app.pending_rules.is_empty());
+        assert!(app.popup.is_some());
+    }
+
+    #[test]
+    fn test_forward_form_focus_cycles_over_fields() {
+        let mut app = test_app();
+        app.setup_forward_add_form();
+        assert_eq!(app.form_fields.len(), 7);
+
+        for _ in 0..7 {
+            handle_form_key(&mut app, key(KeyCode::Down));
+        }
+        assert_eq!(app.form_focus, 0);
+
+        handle_form_key(&mut app, key(KeyCode::Up));
+        assert_eq!(app.form_focus, 6);
     }
 
     // ── Integration: full SSH flow ─────────────────────────

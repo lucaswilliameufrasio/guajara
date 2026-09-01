@@ -20,6 +20,11 @@ SSH destinations.
   directives. Operates on parsed blocks rather than raw lines.
 - **Hosts file management:** understands IPv4, IPv6, inline comments, and
   multiple hostnames per record.
+- **Port forwarding:** start SSH tunnels (`ssh -N -L`) for one or many hosts at
+  once, queueing multiple rules before starting. Active tunnels are tracked
+  with their PID, shown live in the TUI, and can be stopped from there.
+  Tunnels survive terminal close and are pruned automatically when the ssh
+  process dies.
 - **Guided TUI:** list blocks, select entries, and inspect details without
   exposing raw text editing.
 - **CLI commands:** use from scripts or quick terminal actions.
@@ -56,6 +61,26 @@ guajara
 
 Opens a guided dashboard. Navigate with arrow keys, select with Enter, go back
 with Esc, reload files with `r`, quit with `q`.
+
+Port forwards live under **Port forwards** in the main menu: first select an
+existing SSH host, then fill in the forwarding rule. If no host is configured,
+press `n` to open SSH host management. The list shows every active tunnel
+(including tunnels started outside Guajará), refreshes every 2 seconds, and
+uses `x` to stop the selected tunnel. Press `a` to queue forwarding rules and
+start them together.
+
+### Forward CLI commands
+
+```bash
+guajara forward list
+guajara forward add --host <h> --local-port <p> --target-host <h> --target-port <p>
+guajara forward stop <host>
+guajara forward stop-all
+```
+
+Each tunnel runs one `ssh` process per host carrying all its `-L` rules. State
+is kept in `~/.config/guajara/forwards.json`; dead tunnels are pruned on every
+read, so `list` only ever shows what is actually running.
 
 ### SSH CLI commands
 

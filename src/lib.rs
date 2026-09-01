@@ -1,6 +1,8 @@
+pub mod forward;
 pub mod hosts;
 pub mod ssh;
 
+pub use forward::{ForwardRule, ForwardState, Tunnel};
 pub use hosts::HostsFile;
 pub use ssh::SshConfig;
 

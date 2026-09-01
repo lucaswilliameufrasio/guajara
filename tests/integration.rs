@@ -1,8 +1,308 @@
+use guajara::forward;
 use guajara::hosts::HostsFile;
 use guajara::ssh::SshConfig;
-use guajara::write_file;
+use guajara::{ForwardRule, ForwardState, Tunnel, write_file};
 use std::os::unix::fs::PermissionsExt;
 use tempfile::TempDir;
+
+// ── Forward integration tests ──────────────────────────────
+
+fn fwd_rule(host: &str, local_port: u16, target_host: &str, target_port: u16) -> ForwardRule {
+    ForwardRule {
+        host: host.to_string(),
+        local_port,
+        target_host: target_host.to_string(),
+        target_port,
+    }
+}
+
+fn alive_pid() -> u32 {
+    std::process::id()
+}
+
+#[test]
+fn test_forward_state_save_and_load_roundtrip() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("forwards.json");
+    let state = ForwardState {
+        tunnels: vec![Tunnel {
+            host: "web1".to_string(),
+            pid: alive_pid(),
+            started_at: 1700000000,
+            rules: vec![
+                fwd_rule("web1", 5432, "db.internal", 5432),
+                fwd_rule("web1", 8080, "web", 80),
+            ],
+            managed: true,
+        }],
+        last_used: std::collections::HashMap::new(),
+    };
+    forward::save(&path, &state).unwrap();
+    let loaded = forward::load(&path);
+    assert_eq!(loaded, state);
+}
+
+#[test]
+fn test_forward_state_persists_last_used_host_times() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("forwards.json");
+    let mut last_used = std::collections::HashMap::new();
+    last_used.insert("web1".to_string(), 20);
+    last_used.insert("web2".to_string(), 10);
+    let state = ForwardState {
+        tunnels: vec![],
+        last_used,
+    };
+
+    forward::save(&path, &state).unwrap();
+    let loaded = forward::load(&path);
+    assert_eq!(loaded.last_used.get("web1"), Some(&20));
+    assert_eq!(loaded.last_used.get("web2"), Some(&10));
+}
+
+#[test]
+fn test_forward_state_survives_across_sessions() {
+    // Simulates two guajara sessions sharing the same state file
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("forwards.json");
+
+    let rules = vec![
+        fwd_rule("web1", 5432, "db.internal", 5432),
+        fwd_rule("web2", 5433, "db2.internal", 5432),
+    ];
+    forward::validate_start(&path, &rules).unwrap();
+
+    let state = ForwardState {
+        tunnels: rules
+            .chunks(1)
+            .map(|chunk| Tunnel {
+                host: chunk[0].host.clone(),
+                pid: alive_pid(),
+                started_at: 1700000000,
+                rules: chunk.to_vec(),
+                managed: true,
+            })
+            .collect(),
+        last_used: std::collections::HashMap::new(),
+    };
+    forward::save(&path, &state).unwrap();
+
+    let next_session = forward::load(&path);
+    assert_eq!(next_session.tunnels.len(), 2);
+    assert_eq!(next_session.tunnels[0].host, "web1");
+    assert_eq!(next_session.tunnels[1].host, "web2");
+}
+
+#[test]
+fn test_forward_validate_rejects_conflicts_before_start() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("forwards.json");
+    let state = ForwardState {
+        tunnels: vec![Tunnel {
+            host: "web1".to_string(),
+            pid: alive_pid(),
+            started_at: 0,
+            rules: vec![fwd_rule("web1", 5432, "db.internal", 5432)],
+            managed: true,
+        }],
+        last_used: std::collections::HashMap::new(),
+    };
+    forward::save(&path, &state).unwrap();
+
+    let err = forward::validate_start(&path, &[fwd_rule("web2", 5432, "db", 5432)]).unwrap_err();
+    assert!(err.contains("5432"));
+
+    let err = forward::validate_start(&path, &[fwd_rule("web1", 6000, "db", 5432)]).unwrap_err();
+    assert!(err.contains("already active"));
+}
+
+#[test]
+fn test_forward_stop_tunnel_removes_from_state() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("forwards.json");
+    let state = ForwardState {
+        tunnels: vec![
+            Tunnel {
+                host: "web1".to_string(),
+                pid: 4_000_000_000,
+                started_at: 0,
+                rules: vec![fwd_rule("web1", 5432, "db", 5432)],
+                managed: true,
+            },
+            Tunnel {
+                host: "web2".to_string(),
+                pid: 4_000_000_001,
+                started_at: 0,
+                rules: vec![fwd_rule("web2", 5433, "db", 5433)],
+                managed: true,
+            },
+        ],
+        last_used: std::collections::HashMap::new(),
+    };
+    forward::save(&path, &state).unwrap();
+
+    // Both pids are dead, so load() prunes everything
+    let loaded = forward::load(&path);
+    assert!(loaded.tunnels.is_empty());
+
+    // Stopping a pruned host reports not-found
+    assert!(!forward::stop_tunnel(&path, "web1").unwrap());
+}
+
+// ── Forward process-control integration (real processes) ──
+
+/// Spawns a detached `sleep 60` and returns its PID. The shell exits right
+/// away, so the sleeper is reparented and reaped when killed — the same
+/// lifecycle a nohup'd ssh tunnel has. The sleeper's output is redirected so
+/// it does not hold the capture pipe open.
+fn spawn_orphan_sleeper() -> u32 {
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("sleep 60 >/dev/null 2>&1 & echo $!")
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+#[test]
+fn test_forward_stop_tunnel_kills_process_and_updates_state() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("forwards.json");
+    let pid = spawn_orphan_sleeper();
+    let state = ForwardState {
+        tunnels: vec![Tunnel {
+            host: "web1".to_string(),
+            pid,
+            started_at: 0,
+            rules: vec![fwd_rule("web1", 5432, "db.internal", 5432)],
+            managed: true,
+        }],
+        last_used: std::collections::HashMap::new(),
+    };
+    forward::save(&path, &state).unwrap();
+
+    // Alive at load time, so the tunnel is listed
+    assert_eq!(forward::load(&path).tunnels.len(), 1);
+
+    assert!(forward::stop_tunnel(&path, "web1").unwrap());
+    assert!(!forward::is_alive(pid));
+    assert!(forward::load(&path).tunnels.is_empty());
+    assert!(!forward::stop_tunnel(&path, "web1").unwrap());
+}
+
+#[test]
+fn test_forward_terminate_handles_unreaped_child_zombie() {
+    let child = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    std::mem::forget(child);
+
+    assert!(forward::terminate(pid).is_ok());
+    assert!(!forward::is_alive(pid));
+}
+
+#[test]
+fn test_forward_stop_all_stops_every_tunnel() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("forwards.json");
+    let pid_a = spawn_orphan_sleeper();
+    let pid_b = spawn_orphan_sleeper();
+    let state = ForwardState {
+        tunnels: vec![
+            Tunnel {
+                host: "web1".to_string(),
+                pid: pid_a,
+                started_at: 0,
+                rules: vec![fwd_rule("web1", 5432, "db", 5432)],
+                managed: true,
+            },
+            Tunnel {
+                host: "web2".to_string(),
+                pid: pid_b,
+                started_at: 0,
+                rules: vec![fwd_rule("web2", 5433, "db", 5433)],
+                managed: true,
+            },
+        ],
+        last_used: std::collections::HashMap::new(),
+    };
+    forward::save(&path, &state).unwrap();
+
+    let stopped = forward::stop_all(&path).unwrap();
+    assert_eq!(stopped, 2);
+    assert!(!forward::is_alive(pid_a));
+    assert!(!forward::is_alive(pid_b));
+    assert!(forward::load(&path).tunnels.is_empty());
+
+    // Stopping again with an empty state is a no-op
+    assert_eq!(forward::stop_all(&path).unwrap(), 0);
+}
+
+#[test]
+fn test_forward_stop_all_with_no_state_returns_zero() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("missing.json");
+    assert_eq!(forward::stop_all(&path).unwrap(), 0);
+}
+
+#[test]
+fn test_forward_lifecycle_validate_start_stop_revalidate() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("forwards.json");
+    let pid = spawn_orphan_sleeper();
+    let state = ForwardState {
+        tunnels: vec![Tunnel {
+            host: "web1".to_string(),
+            pid,
+            started_at: 0,
+            rules: vec![fwd_rule("web1", 5432, "db.internal", 5432)],
+            managed: true,
+        }],
+        last_used: std::collections::HashMap::new(),
+    };
+    forward::save(&path, &state).unwrap();
+
+    // Same host busy
+    let err = forward::validate_start(&path, &[fwd_rule("web1", 6000, "x", 1)]).unwrap_err();
+    assert!(err.contains("already active"));
+
+    // Same local port busy on another host
+    let err = forward::validate_start(&path, &[fwd_rule("web2", 5432, "x", 1)]).unwrap_err();
+    assert!(err.contains("already in use"));
+
+    // A different host with a free port is fine while web1 runs
+    forward::validate_start(&path, &[fwd_rule("web2", 5433, "x", 1)]).unwrap();
+
+    // After stopping web1, its host and port free up
+    assert!(forward::stop_tunnel(&path, "web1").unwrap());
+    forward::validate_start(&path, &[fwd_rule("web1", 5432, "db.internal", 5432)]).unwrap();
+}
+
+#[test]
+fn test_forward_state_file_is_pretty_json() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("forwards.json");
+    let state = ForwardState {
+        tunnels: vec![Tunnel {
+            host: "web1".to_string(),
+            pid: 4_000_000_000,
+            started_at: 1700000000,
+            rules: vec![fwd_rule("web1", 5432, "db.internal", 5432)],
+            managed: true,
+        }],
+        last_used: std::collections::HashMap::new(),
+    };
+    forward::save(&path, &state).unwrap();
+    let content = std::fs::read_to_string(&path).unwrap();
+    assert!(content.starts_with("{\n"));
+    assert!(content.ends_with('\n'));
+    assert!(content.contains("\"local_port\": 5432"));
+}
 
 // ── SSH integration tests ─────────────────────────────────
 
