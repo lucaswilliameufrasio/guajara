@@ -62,6 +62,60 @@ guajara
 Opens a guided dashboard. Navigate with arrow keys, select with Enter, go back
 with Esc, reload files with `r`, quit with `q`.
 
+In SSH host forms, press Enter on **IdentityFile** to select a private key from
+`~/.ssh`, create an Ed25519 key, enter a custom path, or clear the selection.
+Creation requires `ssh-keygen` and asks for a passphrase directly in the terminal.
+Save the host afterward; cancelling the form does not delete the new key. Install
+the generated `.pub` file on the server before connecting.
+
+Press **`t`** in the SSH host list or details to test a saved host's connection
+and authentication. The test runs `true` remotely, then disconnects, without
+starting configured tunnels. Password and host-key prompts remain in the
+terminal; press Enter afterward to return to the TUI. Save form changes first.
+
+Press **`o`** in SSH hosts, active tunnels, or forwarding host selection to switch
+between name and most-recent-use ordering while keeping the same item selected.
+Host usage is recorded for tunnel starts and successful SSH tests (TUI or CLI).
+Without recorded usage, hosts remain alphabetical; `r` reloads usage history.
+
+Press **`u`** in the SSH host list or details to **duplicate a host locally**.
+The form suggests a unique `-copy` alias; change it and the `HostName` (for
+example, from a public IP to a Tailscale address), then select Save. User, port,
+identity references, comments, repeated identity directives and custom options
+are preserved unless you change the corresponding field. The original remains
+unchanged, no key is created or copied, and cancelling writes nothing. A new
+alias is required; the duplicate is inserted after the source block to keep
+its position relative to later wildcard defaults. This is separate from `c`,
+which copies hosts to another machine.
+
+### Remote SSH hosts and batch copy
+
+In the local SSH host list:
+
+- Select a saved destination and press **`m`** to manage that machine's SSH hosts.
+- Mark one or more local hosts with **Space**, then press **`c`** to copy them.
+  With no marked hosts, `c` copies the selected host. Choose the destination,
+  then choose an existing remote key, create a remote Ed25519 key, enter a remote
+  path, or use remote SSH defaults for each copied host.
+
+The remote manager offers **`a`** add, **`e`** edit, **`d`** delete, **`t`** test
+from the remote machine, and **`r`** reload. **Esc** returns to the local list.
+Every write shows a diff: **`y`** confirms, **`n`** or **Esc** cancels. Batch
+copy is one combined write and refuses duplicate aliases. If the config changes
+externally, reload and review instead of overwriting it.
+
+Private keys are never copied. Local identity/agent/certificate bindings are
+removed from copied blocks and replaced by the chosen remote identity. Review
+other paths, `Include`, wildcard defaults and `ProxyJump` dependencies in the
+preview; included files are preserved but not expanded or managed. Newly created
+keys remain remote if you cancel, and their public keys still need installing
+on the servers you want that machine to access.
+
+Destinations need SSH access, a POSIX shell and standard Linux/macOS utilities;
+key creation needs `ssh-keygen`. **No Python or remote Guajará installation.**
+Only the connected user's `~/.ssh/config` is managed, without sudo. Writes are
+atomic, mode 600, and refuse symlink configs. Limit: 2 MiB per config.
+
 Port forwards live under **Port forwards** in the main menu: first select an
 existing SSH host, then fill in the forwarding rule. If no host is configured,
 press `n` to open SSH host management. The list shows every active tunnel
@@ -87,6 +141,7 @@ read, so `list` only ever shows what is actually running.
 ```bash
 guajara ssh list
 guajara ssh show <selector>
+guajara ssh test <selector>
 guajara ssh set <selector> <key> <value>
 guajara ssh unset <selector> <key>
 guajara ssh add <pattern>... [--hostname <h>] [--user <u>] [--port <p>]
@@ -145,6 +200,13 @@ make test-ci COVERAGE_FAIL=1 COVERAGE_MIN=80
 ```
 
 ## Testing
+
+The remote integration suite starts its own loopback-only OpenSSH server with
+temporary keys, pinned host keys and an isolated remote home. It never connects
+to user-configured hosts. It requires `/usr/sbin/sshd` and `ssh-keygen` (included
+with macOS; on Linux, install the OpenSSH client/server packages and ensure the
+system's privilege-separation directory exists, usually `/run/sshd`). No root
+privileges are required to run the test server. CI installs these prerequisites.
 
 ```bash
 cargo nextest run

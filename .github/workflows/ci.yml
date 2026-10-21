@@ -19,6 +19,11 @@ jobs:
           components: rustfmt, clippy
       - uses: taiki-e/install-action@cargo-nextest
       - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Install isolated SSH integration test prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes openssh-server
+          sudo install -d -m 0755 /run/sshd
       - name: CI
         run: make test-ci
       - name: Upload coverage HTML

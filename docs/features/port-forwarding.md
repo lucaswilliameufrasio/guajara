@@ -59,9 +59,13 @@ tunnels started elsewhere, auto-restart on failure.
 - **Live status in TUI**: the forwards list re-checks tunnel liveness every 2s
   (and on entry / `r`), so dead tunnels disappear and survivors keep showing
   `UP`. **Source**: user request ("saber que está ativo").
-- **Sorting**: SSH hosts and forwarding tunnels are sorted by name by default;
-  `o` toggles to descending last-used order. Last-used means the last
-  forwarding started through Guajará and is persisted in the forwarding state.
+- **Sorting**: SSH hosts, forwarding host selection, and forwarding tunnels are
+  sorted by name by default; `o` toggles to descending last-used order while
+  keeping the same entry selected. Host last-use includes forwarding starts
+  and successful SSH connection tests through Guajará, persisted in the
+  forwarding state. Tunnel last-use is its start time. Hosts without history
+  follow used hosts, with alphabetical tie-breaking; an empty history is
+  reported rather than implying that the ordering changed.
   SSH login history is not inferred from shell history or other private files.
   **Why**: `~/.ssh/config` has no reliable last-access field, and reading shell
   history would expose unrelated user activity. **Source**: user feedback.

@@ -110,6 +110,13 @@ pub fn save(path: &Path, state: &ForwardState) -> Result<(), String> {
     std::fs::write(path, json + "\n").map_err(|e| format!("Cannot write {}: {}", path.display(), e))
 }
 
+/// Preserve tunnel state while recording a successful SSH authentication.
+pub fn record_host_use(path: &Path, host: &str) -> Result<(), String> {
+    let mut state = load(path);
+    state.last_used.insert(host.to_string(), unix_now());
+    save(path, &state)
+}
+
 // ── Process control ────────────────────────────────────────
 
 pub fn is_alive(pid: u32) -> bool {

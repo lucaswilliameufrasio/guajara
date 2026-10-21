@@ -1,5 +1,8 @@
+pub mod connection;
 pub mod forward;
 pub mod hosts;
+pub mod identity;
+pub mod remote;
 pub mod ssh;
 
 pub use forward::{ForwardRule, ForwardState, Tunnel};

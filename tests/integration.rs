@@ -626,3 +626,23 @@ fn test_hosts_edit_preserves_comment_style() {
     assert!(hosts.to_string().contains("10.0.0.1"));
     assert!(hosts.to_string().contains("# My NAS device"));
 }
+#[test]
+fn should_record_ssh_use_without_losing_live_tunnels_or_previous_history() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("forwards.json");
+    let mut state = guajara::forward::ForwardState::default();
+    state.last_used.insert("previous".into(), 10);
+    state.tunnels.push(guajara::forward::Tunnel {
+        host: "active".into(),
+        pid: std::process::id(),
+        started_at: 20,
+        rules: vec![],
+        managed: true,
+    });
+    guajara::forward::save(&path, &state).unwrap();
+    guajara::forward::record_host_use(&path, "new-host").unwrap();
+    let reloaded = guajara::forward::load(&path);
+    assert_eq!(reloaded.tunnels, state.tunnels);
+    assert_eq!(reloaded.last_used["previous"], 10);
+    assert!(reloaded.last_used["new-host"] > 0);
+}

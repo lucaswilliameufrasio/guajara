@@ -358,6 +358,82 @@ impl SshConfig {
         insert_at
     }
 
+    /// Duplicate a host without changing its original lines or identity bindings.
+    /// Unchanged fields retain their raw lines, including repeated directives.
+    pub fn duplicate_host(
+        &mut self,
+        source_index: usize,
+        patterns: &[String],
+        fields: &[(String, String)],
+    ) -> Result<(), String> {
+        let hosts = self.hosts();
+        let source = hosts.get(source_index).ok_or("Source host not found")?;
+        if patterns.is_empty()
+            || patterns
+                .iter()
+                .any(|pattern| !crate::connection::is_concrete_host(pattern))
+        {
+            return Err(
+                "Choose a new concrete host alias (not a wildcard or negated pattern)".into(),
+            );
+        }
+        let mut aliases: std::collections::HashSet<String> = hosts
+            .iter()
+            .flat_map(|host| &host.patterns)
+            .map(|pattern| pattern.to_ascii_lowercase())
+            .collect();
+        for pattern in patterns {
+            if !aliases.insert(pattern.to_ascii_lowercase()) {
+                return Err(format!(
+                    "Alias '{pattern}' already exists; choose a different alias"
+                ));
+            }
+        }
+        let mut duplicate = SshConfig {
+            lines: self.lines[source.start_idx..source.end_idx].to_vec(),
+        };
+        let indent: String = duplicate.lines[0]
+            .chars()
+            .take_while(|character| character.is_whitespace())
+            .collect();
+        duplicate.lines[0] = format!("{indent}Host {}", patterns.join(" "));
+        for (key, value) in fields {
+            if !["HostName", "User", "Port", "IdentityFile"].contains(&key.as_str())
+                || value.chars().any(char::is_control)
+            {
+                return Err("Invalid duplicate host field".into());
+            }
+            let original = source
+                .directives
+                .iter()
+                .find(|directive| directive.key.eq_ignore_ascii_case(key))
+                .map(|directive| directive.value.as_str())
+                .unwrap_or_default();
+            if value == original {
+                continue;
+            }
+            if key == "Port"
+                && !value.is_empty()
+                && !value.parse::<u16>().is_ok_and(|port| port > 0)
+            {
+                return Err("Port must be between 1 and 65535".into());
+            }
+            let _ = duplicate.unset(0, key);
+            if !value.is_empty() {
+                duplicate.set(0, key, value)?;
+            }
+        }
+        if !duplicate.lines.last().is_some_and(String::is_empty) {
+            duplicate.lines.push(String::new());
+        }
+        if !self.lines[source.end_idx - 1].is_empty() {
+            duplicate.lines.insert(0, String::new());
+        }
+        self.lines
+            .splice(source.end_idx..source.end_idx, duplicate.lines);
+        Ok(())
+    }
+
     /// Remove the host block starting at `block_start_idx` (inclusive).
     pub fn remove_block(&mut self, block_start_idx: usize) -> Result<(), String> {
         let range = self
