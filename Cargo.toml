@@ -2,6 +2,7 @@
 name = "guajara"
 version = "0.2.0"
 edition = "2024"
+repository = "https://github.com/lucaswilliameufrasio/guajara"
 
 [dependencies]
 clap = { version = "4.6.1", features = ["derive"] }
@@ -12,3 +13,7 @@ serde_json = "1"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+[profile.dist]
+inherits = "release"
+lto = "thin"
