@@ -38,3 +38,12 @@ jobs:
         with:
           name: coverage-lcov
           path: target/coverage/lcov.info
+
+  windows:
+    name: Windows compile check
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check Windows binary
+        run: cargo check --locked --bin guajara
