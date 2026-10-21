@@ -73,14 +73,24 @@ pub fn new_key_path(directory: &Path, name: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+#[cfg(unix)]
+fn create_identity_directory(directory: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    fs::DirBuilder::new().mode(0o700).create(directory)
+}
+
+#[cfg(not(unix))]
+fn create_identity_directory(directory: &Path) -> std::io::Result<()> {
+    // On Windows, inherit the ACL from the user's home directory.
+    fs::create_dir(directory)
+}
+
 /// Inherits the terminal so ssh-keygen handles passphrase input itself.
 pub fn generate(directory: &Path, name: &str) -> Result<PathBuf, String> {
     let path = new_key_path(directory, name)?;
     if !directory.exists() {
-        use std::os::unix::fs::DirBuilderExt;
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(directory)
+        create_identity_directory(directory)
             .map_err(|error| format!("Cannot create SSH directory: {error}"))?;
     }
     let status = Command::new("ssh-keygen")
@@ -92,4 +102,28 @@ pub fn generate(directory: &Path, name: &str) -> Result<PathBuf, String> {
         return Err("Key creation failed or was cancelled; IdentityFile was not changed".into());
     }
     Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::create_identity_directory;
+    use tempfile::tempdir;
+
+    #[test]
+    fn should_create_identity_directory_for_current_platform() {
+        let parent = tempdir().unwrap();
+        let directory = parent.path().join(".ssh");
+
+        create_identity_directory(&directory).unwrap();
+
+        assert!(directory.is_dir());
+        #[cfg(unix)]
+        {
+            use std::fs;
+            use std::os::unix::fs::PermissionsExt;
+
+            let permissions = fs::metadata(&directory).unwrap().permissions();
+            assert_eq!(permissions.mode() & 0o777, 0o700);
+        }
+    }
 }
