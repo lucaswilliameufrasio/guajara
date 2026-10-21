@@ -189,6 +189,7 @@ jobs:
         run: |
           ${{ matrix.packages_install }}
       - name: Build artifacts
+        shell: bash
         env:
           DIST_TAG_FLAG: ${{ needs.plan.outputs.tag-flag }}
         run: |
