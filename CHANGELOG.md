@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.0] - 2026-10-21
+
+### Bug Fixes
+
+- Run Windows artifact build with Bash
+- Create SSH key directory on Windows
+
+### CI / Build
+
+- Configure cargo-dist release automation
+- Limit release targets to macOS and Linux
 ## [0.2.0] - 2026-10-21
 
 ### Bug Fixes
