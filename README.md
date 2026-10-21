@@ -35,19 +35,13 @@ SSH destinations.
 
 ## Install a release
 
-Prebuilt binaries are available for Apple Silicon macOS, ARM64 and x64 Linux,
-and x64 Windows. Installing a release does not require Rust.
+Prebuilt binaries are available for Apple Silicon macOS and ARM64 and x64 Linux.
+Installing a release does not require Rust.
 
 macOS and Linux:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/lucaswilliameufrasio/guajara/releases/latest/download/guajara-installer.sh | sh
-```
-
-Windows PowerShell:
-
-```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/lucaswilliameufrasio/guajara/releases/latest/download/guajara-installer.ps1 | iex"
 ```
 
 ## Requirements

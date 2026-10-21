@@ -1,8 +1,8 @@
 # Releasing
 
 Guajará uses SemVer tags (`vX.Y.Z`) and `cargo-dist` to build platform archives,
-SHA-256 checksums, shell and PowerShell installers, and GitHub Releases. Releases
-are not published to crates.io.
+SHA-256 checksums, a shell installer, and GitHub Releases. Releases are not
+published to crates.io.
 
 ## One-time GitHub setup
 
@@ -30,9 +30,9 @@ The `Prepare Release` workflow uses this environment and the repository's
    git push origin v0.3.0
    ```
 
-4. The `Release` workflow builds Apple Silicon macOS, Linux (ARM64 and x64),
-   and Windows (x64) artifacts, generates checksums and installers,
-   and publishes the GitHub Release.
+4. The `Release` workflow builds Apple Silicon macOS and Linux (ARM64 and x64)
+   artifacts, generates checksums and the shell installer, and publishes the
+   GitHub Release.
 
 ## Bootstrap the existing v0.2.0 tag
 
