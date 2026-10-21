@@ -33,9 +33,26 @@ SSH destinations.
 - **Atomic writes:** content is written to a temp file, then renamed over the
   target.
 
+## Install a release
+
+Prebuilt binaries are available for Apple Silicon macOS, ARM64 and x64 Linux,
+and x64 Windows. Installing a release does not require Rust.
+
+macOS and Linux:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/lucaswilliameufrasio/guajara/releases/latest/download/guajara-installer.sh | sh
+```
+
+Windows PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/lucaswilliameufrasio/guajara/releases/latest/download/guajara-installer.ps1 | iex"
+```
+
 ## Requirements
 
-- Rust toolchain (edition 2024)
+- Rust toolchain (edition 2024) to build from source
 - Recommended: `cargo-nextest`, `cargo-llvm-cov` (install via `make setup`)
 
 ## Build and Run
@@ -222,6 +239,9 @@ cargo llvm-cov nextest --html --lcov
 A GitHub Actions workflow runs on pushes and PRs to `main`. It checks formatting,
 runs clippy, executes all tests with `cargo-nextest`, generates LLVM coverage,
 and uploads the reports as artifacts.
+
+See [docs/releasing.md](docs/releasing.md) for the release and installation
+workflow.
 
 ## Safety
 

@@ -1,0 +1,107 @@
+name: Prepare Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release (for example, 0.3.0 or v0.3.0)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: release-prep-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    if: github.ref == 'refs/heads/main'
+    environment: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main and tags
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+
+      - name: Validate release version
+        id: version
+        env:
+          VERSION_INPUT: ${{ inputs.version }}
+        run: |
+          version="${VERSION_INPUT#v}"
+          if [[ ! "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Version must be a stable SemVer version such as 0.3.0" >&2
+            exit 1
+          fi
+
+          current_version="$(sed -n 's/^version = \"\([^\"]*\)\"/\1/p' Cargo.toml | head -n 1)"
+          latest_version="$(printf '%s\n%s\n' "$current_version" "$version" | sort -V | tail -n 1)"
+          if [[ "$version" == "$current_version" || "$latest_version" != "$version" ]]; then
+            echo "Requested version $version must be greater than current version $current_version" >&2
+            exit 1
+          fi
+
+          if git show-ref --verify --quiet "refs/tags/v$version"; then
+            echo "Tag v$version already exists; release tags are immutable" >&2
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install git-cliff
+        uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2
+        with:
+          tool: git-cliff@2.13.1
+
+      - name: Generate release changelog
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: git cliff --bump --tag "v$VERSION" -o CHANGELOG.md
+
+      - name: Update package version and lockfile
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          sed -i "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
+          cargo check
+
+      - name: Create release preparation PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+          BRANCH: release/v${{ steps.version.outputs.version }}-rc.${{ github.run_attempt }}
+          TITLE: Release v${{ steps.version.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add CHANGELOG.md Cargo.toml Cargo.lock
+          git commit -m "chore(release): prepare for v$VERSION"
+          git push origin HEAD:"$BRANCH"
+
+          cat > "$RUNNER_TEMP/release-pr-body.md" <<EOF
+          Automated release preparation for **v$VERSION**.
+
+          Review and merge this PR before creating the release tag.
+
+          After merging, update local main and push the tag:
+
+          \`\`\`bash
+          git checkout main
+          git pull --rebase
+          git tag v$VERSION
+          git push origin v$VERSION
+          \`\`\`
+
+          The Release workflow will build platform archives, checksums, installers, and publish the GitHub Release.
+          EOF
+
+          gh pr create \
+            --base main \
+            --head "$BRANCH" \
+            --title "$TITLE" \
+            --body-file "$RUNNER_TEMP/release-pr-body.md"
