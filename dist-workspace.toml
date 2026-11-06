@@ -23,3 +23,8 @@ hosting = "github"
 install-updater = false
 # Permit the reviewed manual recovery input and pinned actions in generated CI.
 allow-dirty = ["ci"]
+
+# GitHub no longer offers macOS 14 ARM64 runners; keep Apple Silicon releases
+# on the currently supported macOS 15 ARM64 image.
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
