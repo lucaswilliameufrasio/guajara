@@ -882,6 +882,7 @@ struct TuiApp {
     form_fields: Vec<(String, String)>,
     form_focus: usize,
     form_edit_buffer: String,
+    text_cursor: usize,
     form_edit_active: bool,
     should_quit: bool,
     popup: Option<Popup>,
@@ -916,6 +917,7 @@ impl TuiApp {
             form_fields: Vec::new(),
             form_focus: 0,
             form_edit_buffer: String::new(),
+            text_cursor: 0,
             form_edit_active: false,
             should_quit: false,
             popup: None,
@@ -1903,6 +1905,57 @@ fn handle_tui_key(app: &mut TuiApp, key: event::KeyEvent) {
     }
 }
 
+fn edit_text(value: &mut String, cursor: &mut usize, key: event::KeyEvent) {
+    use crossterm::event::KeyModifiers;
+    *cursor = (*cursor).min(value.len());
+    while !value.is_char_boundary(*cursor) {
+        *cursor -= 1;
+    }
+    match key.code {
+        KeyCode::Left => {
+            if let Some((index, _)) = value[..*cursor].char_indices().next_back() {
+                *cursor = index;
+            }
+        }
+        KeyCode::Right => {
+            if let Some(ch) = value[*cursor..].chars().next() {
+                *cursor += ch.len_utf8();
+            }
+        }
+        KeyCode::Home => *cursor = 0,
+        KeyCode::End => *cursor = value.len(),
+        KeyCode::Backspace => {
+            if let Some((index, _)) = value[..*cursor].char_indices().next_back() {
+                value.drain(index..*cursor);
+                *cursor = index;
+            }
+        }
+        KeyCode::Delete => {
+            if let Some(ch) = value[*cursor..].chars().next() {
+                value.drain(*cursor..*cursor + ch.len_utf8());
+            }
+        }
+        KeyCode::Char(ch)
+            if !ch.is_control()
+                && !key.modifiers.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                ) =>
+        {
+            value.insert(*cursor, ch);
+            *cursor += ch.len_utf8();
+        }
+        _ => {}
+    }
+}
+
+fn text_with_cursor(value: &str, cursor: usize) -> String {
+    let mut cursor = cursor.min(value.len());
+    while !value.is_char_boundary(cursor) {
+        cursor -= 1;
+    }
+    format!("{}▏{}", &value[..cursor], &value[cursor..])
+}
+
 fn handle_form_key(app: &mut TuiApp, key: event::KeyEvent) {
     // Popup takes priority
     if app.popup.is_some() {
@@ -1925,11 +1978,7 @@ fn handle_form_key(app: &mut TuiApp, key: event::KeyEvent) {
                 app.form_edit_active = false;
                 app.form_edit_buffer = String::new();
             }
-            KeyCode::Backspace => {
-                app.form_edit_buffer.pop();
-            }
-            KeyCode::Char(c) => app.form_edit_buffer.push(c),
-            _ => {}
+            _ => edit_text(&mut app.form_edit_buffer, &mut app.text_cursor, key),
         }
         return;
     }
@@ -1992,6 +2041,7 @@ fn handle_form_key(app: &mut TuiApp, key: event::KeyEvent) {
                 },
                 _ => {
                     app.form_edit_buffer = app.form_fields[app.form_focus].1.clone();
+                    app.text_cursor = app.form_edit_buffer.len();
                     app.form_edit_active = true;
                 }
             }
@@ -2031,10 +2081,12 @@ fn handle_identity_key(app: &mut TuiApp, key: event::KeyEvent) {
                             0 => {
                                 app.identity_action = IdentityAction::Name {
                                     value: String::new(),
-                                }
+                                };
+                                app.text_cursor = 0;
                             }
                             1 => {
                                 app.form_edit_buffer = app.form_fields[4].1.clone();
+                                app.text_cursor = app.form_edit_buffer.len();
                                 app.form_edit_active = true;
                                 app.identity_action = IdentityAction::Closed;
                             }
@@ -2050,10 +2102,6 @@ fn handle_identity_key(app: &mut TuiApp, key: event::KeyEvent) {
         }
         IdentityAction::Name { value } => match key.code {
             KeyCode::Esc => app.identity_action = IdentityAction::Closed,
-            KeyCode::Backspace => {
-                value.pop();
-            }
-            KeyCode::Char(character) => value.push(character),
             KeyCode::Enter => match guajara::identity::new_key_path(&app.identity_directory, value)
             {
                 Ok(_) => {
@@ -2063,7 +2111,7 @@ fn handle_identity_key(app: &mut TuiApp, key: event::KeyEvent) {
                 }
                 Err(error) => app.show_popup(PopupKind::Error, "Invalid key name".into(), error),
             },
-            _ => {}
+            _ => edit_text(value, &mut app.text_cursor, key),
         },
         IdentityAction::Closed | IdentityAction::Generate { .. } => {}
     }
@@ -2097,7 +2145,8 @@ fn render_identity_picker(frame: &mut Frame, app: &TuiApp) {
             );
         }
         IdentityAction::Name { value } => {
-            frame.render_widget(Paragraph::new(format!("New Ed25519 key in {}\n\nFilename: {value}▏\n\nEnter: create and choose a passphrase in the terminal\nExisting keys are never replaced automatically.", app.identity_directory.display())).wrap(ratatui::widgets::Wrap { trim: false }), inner);
+            let value = text_with_cursor(value, app.text_cursor);
+            frame.render_widget(Paragraph::new(format!("New Ed25519 key in {}\n\nFilename: {value}\n\nEnter: create and choose a passphrase in the terminal\nExisting keys are never replaced automatically.", app.identity_directory.display())).wrap(ratatui::widgets::Wrap { trim: false }), inner);
         }
         IdentityAction::Closed | IdentityAction::Generate { .. } => {}
     }
@@ -2603,7 +2652,11 @@ fn render_form(frame: &mut Frame, area: Rect, app: &mut TuiApp) {
         let display = if action {
             format!("  [ {} ]{}", label, if focused { " <" } else { "" })
         } else if focused && app.form_edit_active {
-            format!("  {}: {}_", label, app.form_edit_buffer)
+            format!(
+                "  {}: {}",
+                label,
+                text_with_cursor(&app.form_edit_buffer, app.text_cursor)
+            )
         } else {
             format!("  {}: {}", label, val)
         };
@@ -2674,6 +2727,65 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         code.into()
+    }
+
+    #[test]
+    fn edits_existing_text_at_cursor() {
+        let mut app = test_app();
+        app.setup_ssh_add_form();
+        app.screen = TuiScreen::SshAddForm;
+        app.form_fields[0].1 = "café".into();
+        for code in [
+            KeyCode::Enter,
+            KeyCode::Left,
+            KeyCode::Char('!'),
+            KeyCode::Enter,
+        ] {
+            handle_tui_key(&mut app, key(code));
+        }
+        assert_eq!(app.form_fields[0].1, "caf!é");
+    }
+
+    #[test]
+    fn text_editor_handles_boundaries_unicode_and_modified_keys() {
+        use crossterm::event::KeyModifiers;
+        let mut text = "aé中".to_string();
+        let mut cursor = text.len();
+        for code in [
+            KeyCode::Left,
+            KeyCode::Backspace,
+            KeyCode::Home,
+            KeyCode::Delete,
+        ] {
+            edit_text(&mut text, &mut cursor, key(code));
+        }
+        assert_eq!(text, "中");
+        assert_eq!(text_with_cursor(&text, cursor), "▏中");
+        edit_text(&mut text, &mut cursor, key(KeyCode::End));
+        edit_text(&mut text, &mut cursor, key(KeyCode::Right));
+        edit_text(
+            &mut text,
+            &mut cursor,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(text_with_cursor(&text, cursor), "中▏");
+    }
+
+    #[test]
+    fn identity_name_supports_cursor_editing() {
+        let mut app = test_app();
+        app.identity_action = IdentityAction::Name {
+            value: String::new(),
+        };
+        for code in [
+            KeyCode::Char('a'),
+            KeyCode::Char('c'),
+            KeyCode::Left,
+            KeyCode::Char('b'),
+        ] {
+            handle_identity_key(&mut app, key(code));
+        }
+        assert!(matches!(app.identity_action, IdentityAction::Name { value } if value == "abc"));
     }
 
     #[test]
@@ -2771,6 +2883,7 @@ mod tests {
         app.identity_action = IdentityAction::Name {
             value: "new-key".into(),
         };
+        app.text_cursor = "new-key".len();
         terminal.draw(|frame| render_tui(frame, &mut app)).unwrap();
         let text: String = terminal
             .backend()

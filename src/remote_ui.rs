@@ -87,6 +87,7 @@ struct RemoteApp {
     local_path: PathBuf,
     session: Option<Session>,
     view: View,
+    text_cursor: usize,
 }
 
 impl HostForm {
@@ -337,13 +338,7 @@ impl RemoteApp {
                             form.fields[form.focus].1 = form.editing.take().unwrap_or_default()
                         }
                         KeyCode::Esc => form.editing = None,
-                        KeyCode::Backspace => {
-                            buffer.pop();
-                        }
-                        KeyCode::Char(character) if !character.is_control() => {
-                            buffer.push(character)
-                        }
-                        _ => {}
+                        _ => edit_text(buffer, &mut self.text_cursor, key),
                     }
                 } else {
                     match key.code {
@@ -371,7 +366,10 @@ impl RemoteApp {
                                     selected: form.index.unwrap_or(0),
                                 }
                             }
-                            _ => form.editing = Some(form.fields[form.focus].1.clone()),
+                            _ => {
+                                self.text_cursor = form.fields[form.focus].1.len();
+                                form.editing = Some(form.fields[form.focus].1.clone());
+                            }
                         },
                         _ => {}
                     }
@@ -400,12 +398,14 @@ impl RemoteApp {
                         }
                         match *selected - paths.len() {
                             0 => {
+                                self.text_cursor = 0;
                                 self.view = View::KeyName {
                                     value: String::new(),
                                     purpose,
                                 }
                             }
                             1 => {
+                                self.text_cursor = 0;
                                 self.view = View::IdentityPath {
                                     value: String::new(),
                                     purpose,
@@ -420,10 +420,6 @@ impl RemoteApp {
             View::KeyName { value, purpose } | View::IdentityPath { value, purpose } => {
                 match key.code {
                     KeyCode::Esc => return Ok(Effect::Keys(purpose.clone())),
-                    KeyCode::Backspace => {
-                        value.pop();
-                    }
-                    KeyCode::Char(character) if !character.is_control() => value.push(character),
                     KeyCode::Enter => {
                         let value = value.clone();
                         let purpose = purpose.clone();
@@ -441,7 +437,7 @@ impl RemoteApp {
                         }
                         return self.choose_identity(purpose, Some(value));
                     }
-                    _ => {}
+                    _ => edit_text(value, &mut self.text_cursor, key),
                 }
             }
             View::Preview {
@@ -635,10 +631,13 @@ impl RemoteApp {
                     .iter()
                     .enumerate()
                     .map(|(index, (key, value))| {
-                        let value = if index == form.focus {
-                            form.editing.as_deref().unwrap_or(value)
+                        let value = if index == form.focus && form.editing.is_some() {
+                            text_with_cursor(
+                                form.editing.as_deref().unwrap_or(value),
+                                self.text_cursor,
+                            )
                         } else {
-                            value
+                            value.clone()
                         };
                         format!("{key:<14} {value}")
                     })
@@ -688,7 +687,7 @@ impl RemoteApp {
             }
             View::KeyName { value, .. } | View::IdentityPath { value, .. } => {
                 frame.render_widget(
-                    Paragraph::new(format!("{value}▏"))
+                    Paragraph::new(text_with_cursor(value, self.text_cursor))
                         .block(Block::bordered().title(" Remote identity — never a local key ")),
                     area,
                 );
@@ -782,6 +781,7 @@ pub(super) fn run(
         local_path: local_path.to_path_buf(),
         session: None,
         view,
+        text_cursor: 0,
     };
     let mut effect = initial;
     loop {
@@ -836,6 +836,33 @@ pub(super) fn run(
 mod tests {
     use super::*;
 
+    #[test]
+    fn remote_form_and_identity_path_edit_at_cursor() {
+        let mut app = app();
+        app.handle(KeyCode::Char('e').into()).unwrap();
+        app.handle(KeyCode::Enter.into()).unwrap();
+        app.handle(KeyCode::Home.into()).unwrap();
+        app.handle(KeyCode::Char('X').into()).unwrap();
+        app.handle(KeyCode::Enter.into()).unwrap();
+        assert!(matches!(&app.view, View::Form(form) if form.fields[0].1 == "Xremote-existing"));
+
+        app.view = View::IdentityPath {
+            value: String::new(),
+            purpose: IdentityPurpose::Form(HostForm::new(&SshConfig::parse(""), None)),
+        };
+        app.text_cursor = 0;
+        for code in [
+            KeyCode::Char('/'),
+            KeyCode::Char('b'),
+            KeyCode::Left,
+            KeyCode::Char('a'),
+        ] {
+            app.handle(code.into()).unwrap();
+        }
+        app.handle(KeyCode::Enter.into()).unwrap();
+        assert!(matches!(&app.view, View::Form(form) if form.fields[4].1 == "\"/ab\""));
+    }
+
     fn app() -> RemoteApp {
         let original = Snapshot {
             exists: true,
@@ -852,6 +879,7 @@ mod tests {
                 original,
             }),
             view: View::Hosts { selected: 0 },
+            text_cursor: 0,
         }
     }
 
