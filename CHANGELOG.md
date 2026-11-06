@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.1] - 2026-11-06
+
+### Bug Fixes
+
+- Support cursor-based text editing
+
+### Chores
+
+- Set usage of rust 1.99.1
 ## [0.3.0] - 2026-10-21
 
 ### Bug Fixes
@@ -13,6 +22,10 @@ All notable changes to this project will be documented in this file.
 
 - Configure cargo-dist release automation
 - Limit release targets to macOS and Linux
+
+### Chores
+
+- Prepare for v0.3.0
 ## [0.2.0] - 2026-10-21
 
 ### Bug Fixes
