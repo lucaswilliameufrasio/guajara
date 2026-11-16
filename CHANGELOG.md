@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.0] - 2026-11-16
+
+### Bug Fixes
+
+- Use supported macOS ARM runner
+
+### Features
+
+- Expand host management and contextual help
 ## [0.3.1] - 2026-11-06
 
 ### Bug Fixes
@@ -11,6 +20,7 @@ All notable changes to this project will be documented in this file.
 ### Chores
 
 - Set usage of rust 1.99.1
+- Prepare for v0.3.1
 ## [0.3.0] - 2026-10-21
 
 ### Bug Fixes
