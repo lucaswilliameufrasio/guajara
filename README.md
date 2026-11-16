@@ -71,10 +71,12 @@ guajara
 ```
 
 Opens a guided dashboard. Navigate with arrow keys, select with Enter, go back
-with Esc, reload files with `r`, quit with `q`.
+with Esc, reload files with `r`, quit with `q`. Press `?` for contextual
+shortcuts; the footer shows the shortcuts that fit. While editing text, `?`
+is entered as text instead.
 
 In SSH host forms, press Enter on **IdentityFile** to select a private key from
-`~/.ssh`, create an Ed25519 key, enter a custom path, or clear the selection.
+`~/.ssh`, create an Ed25519 or RSA 4096 key, enter a custom path, or clear the selection.
 Creation requires `ssh-keygen` and asks for a passphrase directly in the terminal.
 Save the host afterward; cancelling the form does not delete the new key. Install
 the generated `.pub` file on the server before connecting.
@@ -88,6 +90,12 @@ Press **`o`** in SSH hosts, active tunnels, or forwarding host selection to swit
 between name and most-recent-use ordering while keeping the same item selected.
 Host usage is recorded for tunnel starts and successful SSH tests (TUI or CLI).
 Without recorded usage, hosts remain alphabetical; `r` reloads usage history.
+To include direct `ssh alias` connections, opt in per alias with
+`guajara ssh enable-usage <alias>`, review the proposed SSH config change, and
+confirm it. In the SSH host list or details, press `v` for the same reviewed
+opt-in. Existing effective `LocalCommand` settings are not replaced.
+See [SSH last-use tracking](docs/features/ssh-last-use.md) for limitations and
+how to disable the hook.
 
 Press **`u`** in the SSH host list or details to **duplicate a host locally**.
 The form suggests a unique `-copy` alias; change it and the `HostName` (for
@@ -106,7 +114,7 @@ In the local SSH host list:
 - Select a saved destination and press **`m`** to manage that machine's SSH hosts.
 - Mark one or more local hosts with **Space**, then press **`c`** to copy them.
   With no marked hosts, `c` copies the selected host. Choose the destination,
-  then choose an existing remote key, create a remote Ed25519 key, enter a remote
+  then choose an existing remote key, create a remote Ed25519 or RSA 4096 key, enter a remote
   path, or use remote SSH defaults for each copied host.
 
 The remote manager offers **`a`** add, **`e`** edit, **`d`** delete, **`t`** test
@@ -115,12 +123,25 @@ Every write shows a diff: **`y`** confirms, **`n`** or **Esc** cancels. Batch
 copy is one combined write and refuses duplicate aliases. If the config changes
 externally, reload and review instead of overwriting it.
 
+When copying a single concrete alias that already exists on the destination,
+Guajará leaves it unchanged and offers **`t`** to test that existing alias from
+the destination or **`a`** to select a destination public key for optional
+authorization on the server reached by the local alias. Confirm that both alias
+configurations refer to the intended account: they may differ. Selecting a key
+for authorization does not change the destination's existing `IdentityFile`.
+Ambiguous aliases and batch conflicts are still refused without writing.
+
 Private keys are never copied. Local identity/agent/certificate bindings are
 removed from copied blocks and replaced by the chosen remote identity. Review
 other paths, `Include`, wildcard defaults and `ProxyJump` dependencies in the
 preview; included files are preserved but not expanded or managed. Newly created
-keys remain remote if you cancel, and their public keys still need installing
-on the servers you want that machine to access.
+keys remain remote if you cancel. After saving a copy with a selected identity,
+Guajará optionally offers to install its public key on each target using the
+local alias and existing access from this machine. Confirm each target separately;
+skipping or a failed installation does not undo the saved copy. This modifies the
+target user's `~/.ssh/authorized_keys`, refuses a symlink there and does not copy
+the private key. The target must accept your existing login and use the standard
+authorized keys path; test the connection from the remote machine afterward.
 
 Destinations need SSH access, a POSIX shell and standard Linux/macOS utilities;
 key creation needs `ssh-keygen`. **No Python or remote Guajará installation.**

@@ -24,6 +24,9 @@ struct HostForm {
 #[derive(Clone)]
 enum IdentityPurpose {
     Form(HostForm),
+    Existing {
+        alias: String,
+    },
     Copy {
         indices: Vec<usize>,
         assignments: Vec<(usize, Option<String>)>,
@@ -31,6 +34,13 @@ enum IdentityPurpose {
 }
 
 enum View {
+    Help {
+        previous: Box<View>,
+        scroll: u16,
+    },
+    Conflict {
+        alias: String,
+    },
     Destinations {
         aliases: Vec<String>,
         selected: usize,
@@ -50,6 +60,11 @@ enum View {
         value: String,
         purpose: IdentityPurpose,
     },
+    KeyAlgorithm {
+        name: String,
+        selected: usize,
+        purpose: IdentityPurpose,
+    },
     IdentityPath {
         value: String,
         purpose: IdentityPurpose,
@@ -58,6 +73,9 @@ enum View {
         updated: SshConfig,
         previous: Box<View>,
         scroll: u16,
+    },
+    Authorize {
+        remaining: Vec<(String, String)>,
     },
     Message {
         text: String,
@@ -74,9 +92,14 @@ enum Effect {
     Keys(IdentityPurpose),
     CreateKey {
         name: String,
+        algorithm: guajara::identity::KeyAlgorithm,
         purpose: IdentityPurpose,
     },
     Save(SshConfig),
+    Authorize {
+        alias: String,
+        identity: String,
+    },
     Test(String),
     Reload,
     Exit,
@@ -88,6 +111,32 @@ struct RemoteApp {
     session: Option<Session>,
     view: View,
     text_cursor: usize,
+    pending_authorizations: Vec<(String, String)>,
+}
+
+fn existing_single_alias(
+    source: &SshConfig,
+    indices: &[usize],
+    destination: &SshConfig,
+) -> Option<String> {
+    if indices.len() != 1 {
+        return None;
+    }
+    let hosts = source.hosts();
+    let host = hosts.get(indices[0])?;
+    if host.patterns.len() != 1 || !guajara::connection::is_concrete_host(&host.patterns[0]) {
+        return None;
+    }
+    let alias = &host.patterns[0];
+    let matching = destination
+        .hosts()
+        .into_iter()
+        .filter(|host| host.patterns.iter().any(|pattern| pattern == alias))
+        .count();
+    if matching != 1 {
+        return None;
+    }
+    Some(alias.clone())
 }
 
 impl HostForm {
@@ -206,6 +255,17 @@ impl RemoteApp {
         identity: Option<String>,
     ) -> Result<Effect, String> {
         match purpose {
+            IdentityPurpose::Existing { alias } => {
+                if let Some(identity) = identity {
+                    self.view = View::Authorize {
+                        remaining: vec![(alias, identity)],
+                    };
+                } else {
+                    self.view = View::Conflict { alias };
+                    self.message("Select a specific remote key to authorize. SSH defaults do not identify a single key.".into());
+                }
+                Ok(Effect::None)
+            }
             IdentityPurpose::Form(mut form) => {
                 form.fields[4].1 = identity
                     .map(|path| remote::config_path(&path))
@@ -224,6 +284,18 @@ impl RemoteApp {
                 if assignments.len() == indices.len() {
                     let session = self.session.as_ref().ok_or("No remote session")?;
                     let updated = remote::copy_hosts(&self.source, &assignments, &session.config)?;
+                    let hosts = self.source.hosts();
+                    self.pending_authorizations = assignments
+                        .iter()
+                        .filter_map(|(index, identity)| {
+                            let alias = hosts
+                                .get(*index)?
+                                .patterns
+                                .iter()
+                                .find(|alias| guajara::connection::is_concrete_host(alias))?;
+                            Some((alias.clone(), identity.clone()?))
+                        })
+                        .collect();
                     self.view = View::Hosts { selected: 0 };
                     self.preview(updated);
                     Ok(Effect::None)
@@ -238,7 +310,48 @@ impl RemoteApp {
     }
 
     fn handle(&mut self, key: event::KeyEvent) -> Result<Effect, String> {
+        if key.code == KeyCode::Char('?')
+            && !matches!(
+                &self.view,
+                View::KeyName { .. }
+                    | View::IdentityPath { .. }
+                    | View::Form(HostForm {
+                        editing: Some(_),
+                        ..
+                    })
+                    | View::Message { .. }
+                    | View::Help { .. }
+            )
+        {
+            let previous = std::mem::replace(&mut self.view, View::Hosts { selected: 0 });
+            self.view = View::Help {
+                previous: Box::new(previous),
+                scroll: 0,
+            };
+            return Ok(Effect::None);
+        }
         match &mut self.view {
+            View::Help { scroll, .. } => match key.code {
+                KeyCode::Esc | KeyCode::Char('?') => {
+                    let view = std::mem::replace(&mut self.view, View::Hosts { selected: 0 });
+                    if let View::Help { previous, .. } = view {
+                        self.view = *previous;
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => *scroll = scroll.saturating_add(1),
+                KeyCode::Up | KeyCode::Char('k') => *scroll = scroll.saturating_sub(1),
+                _ => {}
+            },
+            View::Conflict { alias } => match key.code {
+                KeyCode::Char('t') => return Ok(Effect::Test(alias.clone())),
+                KeyCode::Char('a') => {
+                    return Ok(Effect::Keys(IdentityPurpose::Existing {
+                        alias: alias.clone(),
+                    }));
+                }
+                KeyCode::Esc => return Ok(Effect::Exit),
+                _ => {}
+            },
             View::Message { .. } => {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
                     let view = std::mem::replace(&mut self.view, View::Hosts { selected: 0 });
@@ -385,6 +498,7 @@ impl RemoteApp {
                     KeyCode::Esc => {
                         self.view = match purpose.clone() {
                             IdentityPurpose::Form(form) => View::Form(form),
+                            IdentityPurpose::Existing { alias } => View::Conflict { alias },
                             IdentityPurpose::Copy { .. } => View::Hosts { selected: 0 },
                         };
                     }
@@ -425,10 +539,12 @@ impl RemoteApp {
                         let purpose = purpose.clone();
                         if matches!(self.view, View::KeyName { .. }) {
                             remote::validate_key_name(&value)?;
-                            return Ok(Effect::CreateKey {
+                            self.view = View::KeyAlgorithm {
                                 name: value,
+                                selected: 0,
                                 purpose,
-                            });
+                            };
+                            return Ok(Effect::None);
                         }
                         if !(value.starts_with('/') || value.starts_with("~/")) {
                             return Err(
@@ -440,10 +556,39 @@ impl RemoteApp {
                     _ => edit_text(value, &mut self.text_cursor, key),
                 }
             }
+            View::KeyAlgorithm {
+                name,
+                selected,
+                purpose,
+            } => match key.code {
+                KeyCode::Esc => {
+                    self.view = View::KeyName {
+                        value: name.clone(),
+                        purpose: purpose.clone(),
+                    };
+                }
+                KeyCode::Up | KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('k') => {
+                    *selected = 1 - *selected;
+                }
+                KeyCode::Enter => {
+                    let algorithm = if *selected == 0 {
+                        guajara::identity::KeyAlgorithm::Ed25519
+                    } else {
+                        guajara::identity::KeyAlgorithm::Rsa4096
+                    };
+                    return Ok(Effect::CreateKey {
+                        name: name.clone(),
+                        algorithm,
+                        purpose: purpose.clone(),
+                    });
+                }
+                _ => {}
+            },
             View::Preview {
                 updated, scroll, ..
             } => match key.code {
                 KeyCode::Esc | KeyCode::Char('n') => {
+                    self.pending_authorizations.clear();
                     let view = std::mem::replace(&mut self.view, View::Hosts { selected: 0 });
                     if let View::Preview { previous, .. } = view {
                         self.view = *previous;
@@ -452,6 +597,26 @@ impl RemoteApp {
                 KeyCode::Char('y') => return Ok(Effect::Save(updated.clone())),
                 KeyCode::Down | KeyCode::Char('j') => *scroll = scroll.saturating_add(1),
                 KeyCode::Up | KeyCode::Char('k') => *scroll = scroll.saturating_sub(1),
+                _ => {}
+            },
+            View::Authorize { remaining } => match key.code {
+                KeyCode::Char('y') => {
+                    if let Some((alias, identity)) = remaining.first() {
+                        return Ok(Effect::Authorize {
+                            alias: alias.clone(),
+                            identity: identity.clone(),
+                        });
+                    }
+                }
+                KeyCode::Char('n') => {
+                    if !remaining.is_empty() {
+                        remaining.remove(0);
+                    }
+                    if remaining.is_empty() {
+                        self.view = View::Hosts { selected: 0 };
+                    }
+                }
+                KeyCode::Esc => self.view = View::Hosts { selected: 0 },
                 _ => {}
             },
         }
@@ -467,15 +632,29 @@ impl RemoteApp {
                 let client = Client::new(&self.local_path, &destination)?;
                 let original = client.read()?;
                 let config = SshConfig::parse(&original.content);
-                if !indices.is_empty() {
-                    remote::check_copy(&self.source, &indices, &config)?;
-                }
+                let conflict = if indices.is_empty() {
+                    None
+                } else {
+                    match remote::check_copy(&self.source, &indices, &config) {
+                        Ok(()) => None,
+                        Err(error) => {
+                            match existing_single_alias(&self.source, &indices, &config) {
+                                Some(alias) => Some(alias),
+                                None => return Err(error),
+                            }
+                        }
+                    }
+                };
                 self.session = Some(Session {
                     client,
                     original,
                     config,
                 });
                 self.view = View::Hosts { selected: 0 };
+                if let Some(alias) = conflict {
+                    self.view = View::Conflict { alias };
+                    return Ok(());
+                }
                 if !indices.is_empty() {
                     self.apply(Effect::Keys(IdentityPurpose::Copy {
                         indices,
@@ -496,13 +675,17 @@ impl RemoteApp {
                     purpose,
                 };
             }
-            Effect::CreateKey { name, purpose } => {
+            Effect::CreateKey {
+                name,
+                algorithm,
+                purpose,
+            } => {
                 let path = self
                     .session
                     .as_ref()
                     .ok_or("No remote session")?
                     .client
-                    .create_key(&name)?;
+                    .create_key_with_algorithm(&name, algorithm)?;
                 let next =
                     self.choose_identity(purpose, Some(path.to_string_lossy().into_owned()))?;
                 self.apply(next)?;
@@ -519,8 +702,36 @@ impl RemoteApp {
                     content,
                 };
                 session.config = updated;
-                self.view = View::Hosts { selected: 0 };
-                self.message("Remote SSH config saved.".into());
+                let remaining = std::mem::take(&mut self.pending_authorizations);
+                if remaining.is_empty() {
+                    self.view = View::Hosts { selected: 0 };
+                    self.message("Remote SSH config saved.".into());
+                } else {
+                    self.view = View::Authorize { remaining };
+                }
+            }
+            Effect::Authorize { alias, identity } => {
+                let public_key = self
+                    .session
+                    .as_ref()
+                    .ok_or("No remote session")?
+                    .client
+                    .public_key(&identity)?;
+                let authorization =
+                    remote::install_public_key(&self.local_path, &alias, &public_key)?;
+                if let View::Authorize { remaining } = &mut self.view {
+                    remaining.remove(0);
+                    if remaining.is_empty() {
+                        self.view = View::Hosts { selected: 0 };
+                    }
+                }
+                let result = match authorization {
+                    remote::KeyAuthorization::Installed => "Public key added",
+                    remote::KeyAuthorization::AlreadyPresent => {
+                        "Public key was already present (existing restrictions were preserved)"
+                    }
+                };
+                self.message(format!("{result} for '{alias}'. Test the connection from the remote machine; authorization is not proof of successful login."));
             }
             Effect::Test(alias) => {
                 self.session
@@ -558,30 +769,50 @@ impl RemoteApp {
             .unwrap_or("select destination");
         frame.render_widget(Paragraph::new(format!(" Guajará — REMOTE: {destination}\n Remote ~/.ssh/config — local files and private keys are not transferred")), layout[0]);
         self.render_view(frame, layout[1], &self.view);
-        let help = match &self.view {
-            View::Hosts { .. } => {
-                "j/k navigate  Enter details  a add  e edit  d delete  t test FROM remote  r reload  Esc local"
-            }
-            View::Detail(_) => "e edit  t test FROM remote  Esc list",
-            View::Preview { .. } => {
-                "j/k scroll  y CONFIRM remote write  n/Esc cancel — review paths, Include and ProxyJump dependencies"
-            }
-            View::Form(form) if form.editing.is_some() => {
-                "Type value  Enter apply field  Esc cancel field"
-            }
-            View::Form(_) => "j/k field  Enter edit/select/save  Esc cancel",
-            View::Message { .. } => "Enter/Esc close",
-            View::KeyName { .. } => {
-                "Filename only  Enter create ON REMOTE  Esc back — created keys are not removed on cancel"
-            }
-            View::IdentityPath { .. } => "Remote absolute or ~/ path  Enter select  Esc back",
-            _ => "j/k navigate  Enter select  Esc cancel",
+        let help = remote_help(&self.view);
+        let text_input = matches!(
+            &self.view,
+            View::KeyName { .. }
+                | View::IdentityPath { .. }
+                | View::Form(HostForm {
+                    editing: Some(_),
+                    ..
+                })
+        );
+        let footer = if text_input {
+            help.to_string()
+        } else {
+            adaptive_footer(layout[2].width, &help.lines().collect::<Vec<_>>())
         };
-        frame.render_widget(Paragraph::new(help).wrap(Wrap { trim: false }), layout[2]);
+        frame.render_widget(Paragraph::new(footer).wrap(Wrap { trim: false }), layout[2]);
     }
 
     fn render_view(&self, frame: &mut Frame, area: Rect, view: &View) {
         match view {
+            View::Help { previous, scroll } => {
+                let text = format!(
+                    "{}\n\nj/k or arrows: scroll\n? or Esc: close",
+                    remote_help(previous)
+                );
+                frame.render_widget(
+                    Paragraph::new(text)
+                        .wrap(Wrap { trim: false })
+                        .scroll((*scroll, 0))
+                        .block(Block::bordered().title(" Remote shortcuts ")),
+                    area,
+                );
+            }
+            View::Conflict { alias } => {
+                let text = format!(
+                    "Alias '{alias}' already exists on the destination. Its configuration will not be changed.\n\n`t`: test the existing alias from the destination.\n`a`: choose a public key on the destination and optionally authorize it on the server reached by the local alias.\n\nIMPORTANT: the local and remote alias configurations may point to different accounts or servers. Verify both before authorizing. Choosing a key does not change the existing IdentityFile.\n\nEsc: cancel."
+                );
+                frame.render_widget(
+                    Paragraph::new(text)
+                        .wrap(Wrap { trim: false })
+                        .block(Block::bordered().title(" Alias already exists ")),
+                    area,
+                );
+            }
             View::Destinations {
                 aliases, selected, ..
             } => render_options(
@@ -657,6 +888,9 @@ impl RemoteApp {
             } => {
                 let title = match purpose {
                     IdentityPurpose::Form(_) => " Remote IdentityFile ".into(),
+                    IdentityPurpose::Existing { alias } => format!(
+                        " Remote public key to authorize for {alias} (existing config unchanged) "
+                    ),
                     IdentityPurpose::Copy {
                         indices,
                         assignments,
@@ -679,17 +913,34 @@ impl RemoteApp {
                     .map(|path| path.display().to_string())
                     .collect();
                 options.extend([
-                    "Create new key ON REMOTE…".into(),
-                    "Enter REMOTE path manually…".into(),
+                    "Create new key ON REMOTE (choose filename and algorithm)…".into(),
+                    "Enter REMOTE private key file path, not key contents…".into(),
                     "Use remote SSH default identities (no IdentityFile)".into(),
                 ]);
                 render_options(frame, area, &title, options, *selected);
             }
             View::KeyName { value, .. } | View::IdentityPath { value, .. } => {
+                let title = if matches!(view, View::KeyName { .. }) {
+                    " New remote key filename (e.g. id_server), not key contents "
+                } else {
+                    " Existing remote private key path, not key contents "
+                };
                 frame.render_widget(
                     Paragraph::new(text_with_cursor(value, self.text_cursor))
-                        .block(Block::bordered().title(" Remote identity — never a local key ")),
+                        .block(Block::bordered().title(title)),
                     area,
+                );
+            }
+            View::KeyAlgorithm { selected, .. } => {
+                render_options(
+                    frame,
+                    area,
+                    " Remote key algorithm ",
+                    vec![
+                        "Ed25519 (recommended)".into(),
+                        "RSA 4096 (compatibility)".into(),
+                    ],
+                    *selected,
                 );
             }
             View::Preview {
@@ -710,6 +961,25 @@ impl RemoteApp {
                     area,
                 );
             }
+            View::Authorize { remaining } => {
+                if let Some((alias, identity)) = remaining.first() {
+                    let destination = self
+                        .session
+                        .as_ref()
+                        .map(|session| session.client.destination.as_str())
+                        .unwrap_or("remote");
+                    let text = format!(
+                        "Remote SSH config is saved or unchanged.\n\nAuthorize public key {identity}.pub from {destination} on local target {alias}?\n\nThis connects from this machine to {alias} and modifies that account's authorized_keys. Existing access to {alias} is required. Verify local and remote aliases refer to the intended account; the existing IdentityFile is not changed.\n\nOnly the public key is copied. y: install  n: skip  Esc: skip remaining\n\nRemaining: {}",
+                        remaining.len()
+                    );
+                    frame.render_widget(
+                        Paragraph::new(text)
+                            .wrap(Wrap { trim: false })
+                            .block(Block::bordered().title(" Optional public key authorization ")),
+                        area,
+                    );
+                }
+            }
             View::Message { text, .. } => {
                 frame.render_widget(
                     Paragraph::new(text.as_str())
@@ -719,6 +989,31 @@ impl RemoteApp {
                 );
             }
         }
+    }
+}
+
+fn remote_help(view: &View) -> &'static str {
+    match view {
+        View::Conflict { .. } => "t test FROM remote\na authorize a remote key\nEsc cancel",
+        View::Hosts { .. } => {
+            "j/k navigate\nEnter details\na add\ne edit\nd delete\nt test FROM remote\nr reload\nEsc/q local"
+        }
+        View::Detail(_) => "e edit\nt test FROM remote\nEsc list",
+        View::Preview { .. } => {
+            "j/k scroll\ny confirm remote write\nn/Esc cancel\nReview paths, Include and ProxyJump dependencies"
+        }
+        View::Form(form) if form.editing.is_some() => {
+            "Type value  Enter apply field  Esc cancel field"
+        }
+        View::Form(_) => "j/k field\nEnter edit/select/save\nEsc cancel",
+        View::Message { .. } => "Enter/Esc close",
+        View::Authorize { .. } => "y install public key\nn skip this host\nEsc skip remaining",
+        View::KeyName { .. } => {
+            "Key filename, not key contents. Enter chooses algorithm; Esc back."
+        }
+        View::IdentityPath { .. } => "Remote absolute or ~/ path  Enter select  Esc back",
+        View::Help { .. } => "?/Esc close",
+        _ => "j/k navigate\nEnter select\nEsc cancel",
     }
 }
 
@@ -782,6 +1077,7 @@ pub(super) fn run(
         session: None,
         view,
         text_cursor: 0,
+        pending_authorizations: Vec::new(),
     };
     let mut effect = initial;
     loop {
@@ -789,7 +1085,10 @@ pub(super) fn run(
             if matches!(effect, Effect::Exit) {
                 break;
             }
-            let wait = matches!(effect, Effect::CreateKey { .. } | Effect::Test(_));
+            let wait = matches!(
+                effect,
+                Effect::CreateKey { .. } | Effect::Test(_) | Effect::Authorize { .. }
+            );
             let result = (|| {
                 disable_raw_mode().map_err(|error| error.to_string())?;
                 stdout()
@@ -880,7 +1179,85 @@ mod tests {
             }),
             view: View::Hosts { selected: 0 },
             text_cursor: 0,
+            pending_authorizations: Vec::new(),
         }
+    }
+
+    #[test]
+    fn remote_help_preserves_view_and_question_mark_remains_text_input() {
+        let mut app = app();
+        app.handle(KeyCode::Char('?').into()).unwrap();
+        assert!(matches!(app.view, View::Help { .. }));
+        app.handle(KeyCode::Esc.into()).unwrap();
+        assert!(matches!(app.view, View::Hosts { .. }));
+        app.view = View::KeyName {
+            value: String::new(),
+            purpose: IdentityPurpose::Form(HostForm::new(
+                &app.session.as_ref().unwrap().config,
+                None,
+            )),
+        };
+        app.handle(KeyCode::Char('?').into()).unwrap();
+        assert!(matches!(&app.view, View::KeyName { value, .. } if value == "?"));
+    }
+
+    #[test]
+    fn authorization_requires_explicit_confirmation_and_can_be_skipped() {
+        let mut app = app();
+        app.view = View::Authorize {
+            remaining: vec![("first".into(), "~/.ssh/id_first".into())],
+        };
+        assert!(matches!(
+            app.handle(KeyCode::Char('n').into()).unwrap(),
+            Effect::None
+        ));
+        assert!(matches!(app.view, View::Hosts { .. }));
+        app.view = View::Authorize {
+            remaining: vec![("second".into(), "~/.ssh/id_second".into())],
+        };
+        assert!(matches!(app.handle(KeyCode::Char('y').into()).unwrap(),
+            Effect::Authorize { alias, identity } if alias == "second" && identity == "~/.ssh/id_second"));
+    }
+
+    #[test]
+    fn existing_alias_offers_test_or_key_authorization_without_modifying_config() {
+        let mut app = app();
+        let source = SshConfig::parse("Host first\n HostName source.example\n");
+        let destination = SshConfig::parse(
+            "Host first\n HostName destination.example\n IdentityFile ~/.ssh/old\n",
+        );
+        assert_eq!(
+            existing_single_alias(&source, &[0], &destination),
+            Some("first".into())
+        );
+        assert!(existing_single_alias(&source, &[0, 0], &destination).is_none());
+        assert!(
+            existing_single_alias(&SshConfig::parse("Host first second\n"), &[0], &destination)
+                .is_none()
+        );
+        assert!(
+            existing_single_alias(&source, &[0], &SshConfig::parse("Host first\nHost first\n"))
+                .is_none()
+        );
+        app.session.as_mut().unwrap().config = destination.clone();
+        app.view = View::Conflict {
+            alias: "first".into(),
+        };
+        assert!(
+            matches!(app.handle(KeyCode::Char('t').into()).unwrap(), Effect::Test(alias) if alias == "first")
+        );
+        let Effect::Keys(purpose) = app.handle(KeyCode::Char('a').into()).unwrap() else {
+            panic!("Expected remote key picker")
+        };
+        app.choose_identity(purpose, Some("~/.ssh/id_key".into()))
+            .unwrap();
+        assert!(
+            matches!(&app.view, View::Authorize { remaining } if remaining == &[("first".into(), "~/.ssh/id_key".into())])
+        );
+        assert_eq!(
+            app.session.as_ref().unwrap().config.to_string(),
+            destination.to_string()
+        );
     }
 
     #[test]
@@ -985,8 +1362,11 @@ mod tests {
         for character in "id_remote".chars() {
             app.handle(KeyCode::Char(character).into()).unwrap();
         }
+        app.handle(KeyCode::Enter.into()).unwrap();
+        assert!(matches!(app.view, View::KeyAlgorithm { .. }));
+        app.handle(KeyCode::Down.into()).unwrap();
         assert!(
-            matches!(app.handle(KeyCode::Enter.into()).unwrap(), Effect::CreateKey { name, .. } if name == "id_remote")
+            matches!(app.handle(KeyCode::Enter.into()).unwrap(), Effect::CreateKey { name, algorithm: guajara::identity::KeyAlgorithm::Rsa4096, .. } if name == "id_remote")
         );
         app.view = View::IdentityPath {
             value: "local-relative".into(),

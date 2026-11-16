@@ -46,6 +46,10 @@ enum Commands {
     Ssh(SshCli),
     Hosts(HostsCli),
     Forward(ForwardCli),
+    #[command(hide = true)]
+    RecordSshUse {
+        alias: String,
+    },
 }
 
 #[derive(clap::Args)]
@@ -57,6 +61,10 @@ struct SshCli {
 #[derive(Subcommand)]
 enum SshCommand {
     List,
+    /// Enable last-use tracking for an alias after reviewing the SSH config change
+    EnableUsage {
+        selector: String,
+    },
     /// Test authentication using a fresh SSH connection and the saved config
     Test {
         selector: String,
@@ -157,6 +165,12 @@ fn main() {
         Some(Commands::Ssh(ssh)) => run_ssh(ssh, &ssh_path, &hosts_path, &cli),
         Some(Commands::Hosts(h)) => run_hosts(h, &hosts_path, &ssh_path, &cli),
         Some(Commands::Forward(f)) => run_forward(f, &cli),
+        Some(Commands::RecordSshUse { alias }) => {
+            let path = forward::state_path().with_file_name("ssh-use");
+            if let Err(error) = guajara::ssh_usage::record_use(&path, alias) {
+                eprintln!("Guajará: cannot record SSH usage: {error}");
+            }
+        }
     }
 }
 
@@ -275,6 +289,33 @@ fn run_ssh(ssh: &SshCli, path: &Path, hosts_path: &Path, cli: &Cli) {
 
     match &ssh.command {
         SshCommand::List => cmd_ssh_list(&config),
+        SshCommand::EnableUsage { selector } => {
+            let result = (|| -> Result<(), String> {
+                let executable = std::env::current_exe()
+                    .map_err(|error| format!("Cannot locate Guajará: {error}"))?;
+                let (original, updated) =
+                    guajara::ssh_usage::prepare_enable(path, selector, &executable)?;
+                println!("Proposed changes:");
+                print!("{}", diff(&original, &updated));
+                println!(
+                    "This runs Guajará locally after SSH authentication. Existing Match exec clauses may run during validation."
+                );
+                if cli.dry_run {
+                    println!("[dry-run]");
+                    return Ok(());
+                }
+                if !cli.yes && !confirm("Apply?") {
+                    return Ok(());
+                }
+                guajara::ssh_usage::commit_enable(path, selector, &original, &updated)?;
+                println!("Enabled for {selector}. Reload Guajará to see updated ordering.");
+                Ok(())
+            })();
+            if let Err(error) = result {
+                eprintln!("Error: {error}");
+                std::process::exit(1);
+            }
+        }
         SshCommand::Test { selector } => {
             if resolve_selector(config.select(selector), &config, selector).is_none() {
                 std::process::exit(1);
@@ -849,6 +890,21 @@ struct Popup {
 }
 
 #[derive(Default)]
+enum Overlay {
+    #[default]
+    Closed,
+    Help {
+        scroll: u16,
+    },
+    UsagePreview {
+        alias: String,
+        original: String,
+        updated: String,
+        scroll: u16,
+    },
+}
+
+#[derive(Default)]
 enum IdentityAction {
     #[default]
     Closed,
@@ -859,8 +915,13 @@ enum IdentityAction {
     Name {
         value: String,
     },
+    Algorithm {
+        name: String,
+        selected: usize,
+    },
     Generate {
         name: String,
+        algorithm: guajara::identity::KeyAlgorithm,
     },
 }
 
@@ -873,6 +934,7 @@ struct TuiApp {
     hosts_path: PathBuf,
     forward_state: ForwardState,
     forward_state_path: PathBuf,
+    ssh_usage: std::collections::HashMap<String, u64>,
     pending_rules: Vec<ForwardRule>,
     last_forward_check: Option<Instant>,
     sort_mode: SortMode,
@@ -886,6 +948,7 @@ struct TuiApp {
     form_edit_active: bool,
     should_quit: bool,
     popup: Option<Popup>,
+    overlay: Overlay,
     identity_action: IdentityAction,
     identity_directory: PathBuf,
     pending_connection_test: Option<String>,
@@ -899,6 +962,8 @@ impl TuiApp {
         let hosts = read_file(hosts_path).unwrap_or_default();
         let forward_state_path = forward::state_path();
         let forward_state = forward::active(&forward_state_path);
+        let ssh_usage =
+            guajara::ssh_usage::load_usage(&forward_state_path.with_file_name("ssh-use"));
         let mut app = TuiApp {
             screen: TuiScreen::MainMenu,
             nav_stack: Vec::new(),
@@ -908,6 +973,7 @@ impl TuiApp {
             hosts_path: hosts_path.to_path_buf(),
             forward_state,
             forward_state_path,
+            ssh_usage,
             pending_rules: Vec::new(),
             last_forward_check: None,
             sort_mode: SortMode::Name,
@@ -921,6 +987,7 @@ impl TuiApp {
             form_edit_active: false,
             should_quit: false,
             popup: None,
+            overlay: Overlay::Closed,
             identity_action: IdentityAction::Closed,
             identity_directory: expand_path("~/.ssh"),
             pending_connection_test: None,
@@ -953,6 +1020,8 @@ impl TuiApp {
         self.ssh_config = SshConfig::parse(&s);
         self.hosts_file = HostsFile::parse(&h);
         self.forward_state = forward::active(&self.forward_state_path);
+        self.ssh_usage =
+            guajara::ssh_usage::load_usage(&self.forward_state_path.with_file_name("ssh-use"));
     }
 
     fn navigate_to(&mut self, screen: TuiScreen, selected: usize) {
@@ -1174,12 +1243,8 @@ impl TuiApp {
         hosts.sort_by(|left, right| match self.sort_mode {
             SortMode::Name => left.cmp(right),
             SortMode::LastUsed => self
-                .forward_state
-                .last_used
-                .get(right)
-                .copied()
-                .unwrap_or(0)
-                .cmp(&self.forward_state.last_used.get(left).copied().unwrap_or(0))
+                .alias_last_used(right)
+                .cmp(&self.alias_last_used(left))
                 .then_with(|| left.cmp(right)),
         });
         hosts
@@ -1214,9 +1279,13 @@ impl TuiApp {
     fn host_last_used(&self, host: &guajara::ssh::SshHost) -> u64 {
         host.patterns
             .iter()
-            .filter_map(|pattern| self.forward_state.last_used.get(pattern).copied())
+            .map(|pattern| self.alias_last_used(pattern))
             .max()
             .unwrap_or(0)
+    }
+
+    fn alias_last_used(&self, alias: &str) -> u64 {
+        guajara::ssh_usage::last_used_millis(alias, &self.forward_state.last_used, &self.ssh_usage)
     }
 
     fn forward_display_indices(&self) -> Vec<usize> {
@@ -1263,6 +1332,7 @@ impl TuiApp {
         }
         if self.sort_mode == SortMode::LastUsed
             && self.forward_state.last_used.is_empty()
+            && self.ssh_usage.is_empty()
             && self.screen != TuiScreen::ForwardList
         {
             self.set_status("Sort: last used — no history yet; test SSH or start a tunnel".into());
@@ -1574,14 +1644,19 @@ fn run_tui(ssh_path: &Path, hosts_path: &Path, init: Option<InitScreen>) {
             }
         }
         if matches!(app.identity_action, IdentityAction::Generate { .. })
-            && let IdentityAction::Generate { name } = std::mem::take(&mut app.identity_action)
+            && let IdentityAction::Generate { name, algorithm } =
+                std::mem::take(&mut app.identity_action)
         {
             let result = (|| {
                 disable_raw_mode().map_err(|error| error.to_string())?;
                 stdout()
                     .execute(LeaveAlternateScreen)
                     .map_err(|error| error.to_string())?;
-                guajara::identity::generate(&app.identity_directory, &name)
+                guajara::identity::generate_with_algorithm(
+                    &app.identity_directory,
+                    &name,
+                    algorithm,
+                )
             })();
             stdout().execute(EnterAlternateScreen).ok();
             enable_raw_mode().ok();
@@ -1624,8 +1699,65 @@ fn handle_tui_key(app: &mut TuiApp, key: event::KeyEvent) {
         return;
     }
 
+    let had_overlay = !matches!(app.overlay, Overlay::Closed);
+    match &mut app.overlay {
+        Overlay::Help { scroll } | Overlay::UsagePreview { scroll, .. } => match key.code {
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('?') => {
+                app.overlay = Overlay::Closed;
+            }
+            KeyCode::Down | KeyCode::Char('j') => *scroll = scroll.saturating_add(1),
+            KeyCode::Up | KeyCode::Char('k') => *scroll = scroll.saturating_sub(1),
+            KeyCode::Char('y') if matches!(app.overlay, Overlay::UsagePreview { .. }) => {
+                if let Overlay::UsagePreview {
+                    alias,
+                    original,
+                    updated,
+                    ..
+                } = std::mem::take(&mut app.overlay)
+                {
+                    match guajara::ssh_usage::commit_enable(
+                        &app.ssh_path,
+                        &alias,
+                        &original,
+                        &updated,
+                    ) {
+                        Ok(()) => {
+                            app.ssh_config = SshConfig::parse(&updated);
+                            app.show_popup(
+                                PopupKind::Success,
+                                "SSH usage".into(),
+                                format!("Tracking enabled for {alias}."),
+                            );
+                        }
+                        Err(error) => app.show_popup(PopupKind::Error, "SSH usage".into(), error),
+                    }
+                }
+            }
+            _ => {}
+        },
+        Overlay::Closed => {}
+    }
+    if had_overlay {
+        return;
+    }
+
+    if key.code == KeyCode::Char('?')
+        && matches!(
+            app.identity_action,
+            IdentityAction::Select { .. } | IdentityAction::Algorithm { .. }
+        )
+    {
+        app.overlay = Overlay::Help { scroll: 0 };
+        return;
+    }
+
     if !matches!(app.identity_action, IdentityAction::Closed) {
         handle_identity_key(app, key);
+        return;
+    }
+
+    if key.code == KeyCode::Char('?') && !app.form_edit_active {
+        app.overlay = Overlay::Help { scroll: 0 };
         return;
     }
 
@@ -1791,6 +1923,36 @@ fn handle_tui_key(app: &mut TuiApp, key: event::KeyEvent) {
             {
                 app.setup_ssh_duplicate_form(index);
                 app.navigate_to(TuiScreen::SshDuplicateForm(index), app.selected);
+            }
+        }
+        KeyCode::Char('v') => {
+            let index = match app.screen {
+                TuiScreen::SshList => app.ssh_display_indices().get(app.selected).copied(),
+                TuiScreen::SshDetail(index) => Some(index),
+                _ => None,
+            };
+            if let Some(host) = index.and_then(|index| app.ssh_config.hosts().get(index).cloned()) {
+                let alias = host.patterns.first().cloned().unwrap_or_default();
+                let result = (|| -> Result<(String, String), String> {
+                    let saved = read_file(&app.ssh_path)?;
+                    if saved != app.ssh_config.to_string() {
+                        return Err("Save or reload SSH changes before enabling tracking.".into());
+                    }
+                    let executable = std::env::current_exe()
+                        .map_err(|error| format!("Cannot locate Guajará: {error}"))?;
+                    guajara::ssh_usage::prepare_enable(&app.ssh_path, &alias, &executable)
+                })();
+                match result {
+                    Ok((original, updated)) => {
+                        app.overlay = Overlay::UsagePreview {
+                            alias,
+                            original,
+                            updated,
+                            scroll: 0,
+                        }
+                    }
+                    Err(error) => app.show_popup(PopupKind::Error, "SSH usage".into(), error),
+                }
             }
         }
         KeyCode::Char(' ') if app.screen == TuiScreen::SshList => {
@@ -2105,13 +2267,36 @@ fn handle_identity_key(app: &mut TuiApp, key: event::KeyEvent) {
             KeyCode::Enter => match guajara::identity::new_key_path(&app.identity_directory, value)
             {
                 Ok(_) => {
-                    app.identity_action = IdentityAction::Generate {
+                    app.identity_action = IdentityAction::Algorithm {
                         name: value.clone(),
+                        selected: 0,
                     }
                 }
                 Err(error) => app.show_popup(PopupKind::Error, "Invalid key name".into(), error),
             },
             _ => edit_text(value, &mut app.text_cursor, key),
+        },
+        IdentityAction::Algorithm { name, selected } => match key.code {
+            KeyCode::Esc => {
+                app.identity_action = IdentityAction::Name {
+                    value: name.clone(),
+                };
+            }
+            KeyCode::Up | KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('k') => {
+                *selected = 1 - *selected;
+            }
+            KeyCode::Enter => {
+                let algorithm = if *selected == 0 {
+                    guajara::identity::KeyAlgorithm::Ed25519
+                } else {
+                    guajara::identity::KeyAlgorithm::Rsa4096
+                };
+                app.identity_action = IdentityAction::Generate {
+                    name: name.clone(),
+                    algorithm,
+                };
+            }
+            _ => {}
         },
         IdentityAction::Closed | IdentityAction::Generate { .. } => {}
     }
@@ -2132,8 +2317,8 @@ fn render_identity_picker(frame: &mut Frame, app: &TuiApp) {
             let mut options: Vec<String> =
                 keys.iter().map(|path| path.display().to_string()).collect();
             options.extend([
-                "Create new SSH key…".into(),
-                "Enter path manually…".into(),
+                "Generate a new SSH key (choose name and algorithm)…".into(),
+                "Enter existing private key file path (not key contents)…".into(),
                 "Clear (use SSH defaults)".into(),
             ]);
             let items: Vec<ListItem> = options.into_iter().map(ListItem::new).collect();
@@ -2146,7 +2331,20 @@ fn render_identity_picker(frame: &mut Frame, app: &TuiApp) {
         }
         IdentityAction::Name { value } => {
             let value = text_with_cursor(value, app.text_cursor);
-            frame.render_widget(Paragraph::new(format!("New Ed25519 key in {}\n\nFilename: {value}\n\nEnter: create and choose a passphrase in the terminal\nExisting keys are never replaced automatically.", app.identity_directory.display())).wrap(ratatui::widgets::Wrap { trim: false }), inner);
+            frame.render_widget(Paragraph::new(format!("Generate a new SSH key in {}\n\nKey filename (e.g. id_my_server; not key contents): {value}\n\nEnter: choose algorithm. You will choose a passphrase in the terminal.\nExisting keys are never replaced automatically. Install the public key on the server before connecting.", app.identity_directory.display())).wrap(ratatui::widgets::Wrap { trim: false }), inner);
+        }
+        IdentityAction::Algorithm { selected, .. } => {
+            let options = vec![
+                ListItem::new("Ed25519 (recommended)"),
+                ListItem::new("RSA 4096 (compatibility)"),
+            ];
+            let mut state = ratatui::widgets::ListState::default().with_selected(Some(*selected));
+            frame.render_stateful_widget(
+                List::new(options)
+                    .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan)),
+                inner,
+                &mut state,
+            );
         }
         IdentityAction::Closed | IdentityAction::Generate { .. } => {}
     }
@@ -2194,6 +2392,98 @@ fn render_popup(frame: &mut Frame, area: Rect, popup: &Popup) {
     }
 }
 
+fn shortcuts(screen: TuiScreen) -> &'static [&'static str] {
+    match screen {
+        TuiScreen::MainMenu => &["Enter select", "j/k navigate", "r reload", "q quit"],
+        TuiScreen::SshList => &[
+            "Enter view",
+            "j/k navigate",
+            "v usage tracking",
+            "u duplicate",
+            "t test",
+            "m remote",
+            "Space mark",
+            "c copy",
+            "a add",
+            "e edit",
+            "d delete",
+            "s save",
+            "o sort",
+            "r reload",
+            "Esc back",
+            "q quit",
+        ],
+        TuiScreen::SshDetail(_) => &[
+            "v usage tracking",
+            "u duplicate",
+            "t test",
+            "r reload",
+            "Esc back",
+            "q quit",
+        ],
+        TuiScreen::HostsList => &[
+            "Enter view",
+            "j/k navigate",
+            "a add",
+            "e edit",
+            "d delete",
+            "s save",
+            "r reload",
+            "Esc back",
+            "q quit",
+        ],
+        TuiScreen::HostsDetail(_) => &["r reload", "Esc back", "q quit"],
+        TuiScreen::ForwardList => &[
+            "j/k navigate",
+            "a add",
+            "x stop",
+            "o sort",
+            "r refresh",
+            "Esc back",
+            "q quit",
+        ],
+        TuiScreen::ForwardHostSelect => &[
+            "Enter select",
+            "j/k navigate",
+            "n add host",
+            "o sort",
+            "Esc back",
+            "q quit",
+        ],
+        _ => &["j/k or Up/Down field", "Enter edit/save", "Esc cancel"],
+    }
+}
+
+fn contextual_shortcuts(app: &TuiApp) -> &'static [&'static str] {
+    match app.identity_action {
+        IdentityAction::Select { .. } => {
+            &["j/k or arrows navigate keys", "Enter select", "Esc cancel"]
+        }
+        IdentityAction::Algorithm { .. } => &[
+            "j/k or arrows choose algorithm",
+            "Enter generate key",
+            "Esc back to name",
+        ],
+        _ => shortcuts(app.screen),
+    }
+}
+
+fn adaptive_footer(width: u16, options: &[&str]) -> String {
+    let width = usize::from(width);
+    if width < 6 {
+        return "?".into();
+    }
+    let mut text = "? help".to_string();
+    for option in options {
+        if text.chars().count() + 2 + option.chars().count() > width {
+            continue;
+        }
+        text.push_str("  ");
+        text.push_str(option);
+    }
+    text
+}
+
 fn render_tui(frame: &mut Frame, app: &mut TuiApp) {
     // Clear expired status messages
     if let Some(expires) = app.status_expires_at
@@ -2226,6 +2516,11 @@ fn render_tui(frame: &mut Frame, app: &mut TuiApp) {
 
     let size = frame.area();
     if size.width < 30 || size.height < 10 {
+        frame.render_widget(
+            Paragraph::new("Resize terminal (min 30x10). ? help")
+                .wrap(ratatui::widgets::Wrap { trim: false }),
+            size,
+        );
         return;
     }
 
@@ -2282,39 +2577,67 @@ fn render_tui(frame: &mut Frame, app: &mut TuiApp) {
         TuiScreen::ForwardAddForm => render_form(frame, lo[1], app),
     }
 
-    let st = app.status.clone().unwrap_or_else(|| match app.screen {
-        TuiScreen::MainMenu => "up/down nav  enter select  r reload  q quit".into(),
-        TuiScreen::SshList => {
-            format!(
-                "o sort:{}  Enter view  u duplicate  t test  m remote  Space mark  c copy  a add  e edit  d delete  s save  r reload  Esc back",
-                app.sort_mode.label()
-            )
-        }
-        TuiScreen::HostsList => {
-            "j/k nav  enter view  a add  e edit  d delete  s save  r reload  Esc back".into()
-        }
-        TuiScreen::ForwardList => {
-            format!(
-                "j/k nav  o sort:{}  a add forwards  x stop tunnel  r refresh  Esc back",
-                app.sort_mode.label()
-            )
-        }
-        TuiScreen::ForwardHostSelect => format!("j/k nav  o sort:{}  Enter select  n add SSH host  Esc back", app.sort_mode.label()),
-        TuiScreen::SshDetail(_) => "u duplicate  t test SSH (saved config)  Esc back  r reload".into(),
-        TuiScreen::HostsDetail(_) => "Esc back  r reload".into(),
-        _ if app.form_edit_active => "Enter confirm  Esc cancel  typing".into(),
-        _ => "up/down field  enter edit / save / cancel  Esc back".into(),
-    });
+    let st = if let Some(status) = &app.status {
+        adaptive_footer(lo[2].width, &[status])
+    } else if app.form_edit_active {
+        "Enter confirm  Esc cancel".into()
+    } else {
+        adaptive_footer(lo[2].width, shortcuts(app.screen))
+    };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             st,
             Style::default().fg(Color::DarkGray),
-        ))),
+        )))
+        .wrap(ratatui::widgets::Wrap { trim: true }),
         lo[2],
     );
 
     if !matches!(app.identity_action, IdentityAction::Closed) {
         render_identity_picker(frame, app);
+    }
+
+    match &app.overlay {
+        Overlay::Closed => {}
+        Overlay::Help { scroll } => {
+            let area = frame
+                .area()
+                .centered(Constraint::Percentage(90), Constraint::Percentage(85));
+            frame.render_widget(Clear, area);
+            let mut text = contextual_shortcuts(app).join("\n");
+            text.push_str(
+                "\n\n? or Esc: close\nj/k or arrows: scroll\nIn text fields, ? is typed normally.",
+            );
+            frame.render_widget(
+                Paragraph::new(text)
+                    .scroll((*scroll, 0))
+                    .wrap(ratatui::widgets::Wrap { trim: false })
+                    .block(Block::bordered().title(" Shortcuts — ?/Esc close ")),
+                area,
+            );
+        }
+        Overlay::UsagePreview {
+            alias,
+            original,
+            updated,
+            scroll,
+        } => {
+            let area = frame
+                .area()
+                .centered(Constraint::Percentage(95), Constraint::Percentage(90));
+            frame.render_widget(Clear, area);
+            let text = format!(
+                "Enable tracking for {alias}?\nOpenSSH will run Guajará locally after authentication.\nExisting Match exec clauses may run during validation.\n\n{}",
+                diff(original, updated)
+            );
+            frame.render_widget(
+                Paragraph::new(text)
+                    .scroll((*scroll, 0))
+                    .wrap(ratatui::widgets::Wrap { trim: false })
+                    .block(Block::bordered().title(" y confirm / n or Esc cancel — j/k scroll ")),
+                area,
+            );
+        }
     }
 
     // Popup overlay
@@ -2722,11 +3045,145 @@ mod tests {
         );
         app.forward_state = ForwardState::default();
         app.forward_state_path = PathBuf::from("/nonexistent/__guajara_test_forwards");
+        app.ssh_usage.clear();
         app
     }
 
     fn key(code: KeyCode) -> KeyEvent {
         code.into()
+    }
+
+    #[test]
+    fn help_is_contextual_resizable_and_does_not_intercept_text_input() {
+        let mut app = test_app();
+        app.screen = TuiScreen::SshList;
+        handle_tui_key(&mut app, key(KeyCode::Char('?')));
+        assert!(matches!(app.overlay, Overlay::Help { .. }));
+        for width in [30, 40, 80] {
+            let footer = adaptive_footer(width, shortcuts(app.screen));
+            assert!(footer.starts_with("? help"));
+            assert!(footer.chars().count() <= usize::from(width));
+            let backend = ratatui::backend::TestBackend::new(width, 10);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|frame| render_tui(frame, &mut app)).unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(text.contains("Shortcuts"));
+        }
+        handle_tui_key(&mut app, key(KeyCode::Esc));
+        assert!(matches!(app.overlay, Overlay::Closed));
+        app.setup_ssh_add_form();
+        app.screen = TuiScreen::SshAddForm;
+        app.form_edit_active = true;
+        app.form_edit_buffer.clear();
+        app.text_cursor = 0;
+        handle_tui_key(&mut app, key(KeyCode::Char('?')));
+        assert_eq!(app.form_edit_buffer, "?");
+        assert!(matches!(app.overlay, Overlay::Closed));
+    }
+
+    #[test]
+    fn identity_help_preserves_picker_state_and_name_input() {
+        let mut app = test_app();
+        app.setup_ssh_add_form();
+        app.screen = TuiScreen::SshAddForm;
+        app.identity_action = IdentityAction::Select {
+            keys: vec![PathBuf::from("key")],
+            selected: 1,
+        };
+        for algorithm in [false, true] {
+            if algorithm {
+                app.identity_action = IdentityAction::Algorithm {
+                    name: "example".into(),
+                    selected: 1,
+                };
+            }
+            handle_tui_key(&mut app, key(KeyCode::Char('?')));
+            assert!(matches!(app.overlay, Overlay::Help { .. }));
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(40, 12)).unwrap();
+            terminal.draw(|frame| render_tui(frame, &mut app)).unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(text.contains(if algorithm {
+                "choose algorithm"
+            } else {
+                "navigate keys"
+            }));
+            handle_tui_key(&mut app, key(KeyCode::Esc));
+            if algorithm {
+                assert!(
+                    matches!(&app.identity_action, IdentityAction::Algorithm { name, selected: 1 } if name == "example")
+                );
+            } else {
+                assert!(matches!(
+                    &app.identity_action,
+                    IdentityAction::Select { selected: 1, .. }
+                ));
+            }
+        }
+        app.identity_action = IdentityAction::Name {
+            value: String::new(),
+        };
+        app.text_cursor = 0;
+        handle_tui_key(&mut app, key(KeyCode::Char('?')));
+        assert!(matches!(&app.identity_action, IdentityAction::Name { value } if value == "?"));
+        assert!(matches!(app.overlay, Overlay::Closed));
+    }
+
+    #[test]
+    fn ssh_list_help_contains_navigation_and_quit() {
+        let mut app = test_app();
+        app.screen = TuiScreen::SshList;
+        assert!(shortcuts(app.screen).contains(&"j/k navigate"));
+        assert!(shortcuts(app.screen).contains(&"q quit"));
+        handle_tui_key(&mut app, key(KeyCode::Char('?')));
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(40, 30)).unwrap();
+        terminal.draw(|frame| render_tui(frame, &mut app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("j/k navigate"));
+        assert!(text.contains("q quit"));
+    }
+
+    #[test]
+    fn tui_usage_tracking_previews_cancels_and_requires_confirmation() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config");
+        let original = "Host example\n HostName localhost\n";
+        std::fs::write(&config, original).unwrap();
+        let mut app = test_app();
+        app.ssh_path = config.clone();
+        app.ssh_config = SshConfig::parse(original);
+        app.screen = TuiScreen::SshList;
+        handle_tui_key(&mut app, key(KeyCode::Char('v')));
+        assert!(matches!(app.overlay, Overlay::UsagePreview { .. }));
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), original);
+        handle_tui_key(&mut app, key(KeyCode::Char('n')));
+        assert!(matches!(app.overlay, Overlay::Closed));
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), original);
+        handle_tui_key(&mut app, key(KeyCode::Char('v')));
+        handle_tui_key(&mut app, key(KeyCode::Char('y')));
+        assert!(
+            std::fs::read_to_string(&config)
+                .unwrap()
+                .contains("record-ssh-use example")
+        );
+        assert!(app.popup.is_some());
     }
 
     #[test]
@@ -2823,7 +3280,12 @@ mod tests {
         }
         handle_tui_key(&mut app, key(KeyCode::Enter));
         assert!(
-            matches!(&app.identity_action, IdentityAction::Generate { name } if name == "id_example")
+            matches!(&app.identity_action, IdentityAction::Algorithm { name, .. } if name == "id_example")
+        );
+        handle_tui_key(&mut app, key(KeyCode::Down));
+        handle_tui_key(&mut app, key(KeyCode::Enter));
+        assert!(
+            matches!(&app.identity_action, IdentityAction::Generate { name, algorithm: guajara::identity::KeyAlgorithm::Rsa4096 } if name == "id_example")
         );
         assert!(app.form_fields[4].1.is_empty());
         app.identity_action = IdentityAction::Closed;
@@ -2879,7 +3341,7 @@ mod tests {
         terminal.draw(|frame| render_tui(frame, &mut app)).unwrap();
         let buffer = terminal.backend().buffer();
         let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
-        assert!(text.contains("Create new SSH key"));
+        assert!(text.contains("Generate a new SSH key"));
         app.identity_action = IdentityAction::Name {
             value: "new-key".into(),
         };
@@ -2892,7 +3354,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(text.contains("Filename: new-key"));
+        assert!(text.contains("not key contents): new-key"));
     }
 
     #[test]
@@ -3488,6 +3950,17 @@ mod tests {
         assert_eq!(app.sort_mode, SortMode::LastUsed);
         assert_eq!(app.forward_host_options(), vec!["zebra", "alpha"]);
         assert_eq!(app.selected, 1);
+    }
+
+    #[test]
+    fn external_ssh_usage_affects_host_and_forward_selection_order() {
+        let mut app = test_app();
+        app.ssh_config = SshConfig::parse("Host alpha\nHost zebra\n");
+        app.sort_mode = SortMode::LastUsed;
+        app.forward_state.last_used.insert("alpha".into(), 10);
+        app.ssh_usage.insert("zebra".into(), 20_000);
+        assert_eq!(app.ssh_display_indices(), vec![1, 0]);
+        assert_eq!(app.forward_host_options(), vec!["zebra", "alpha"]);
     }
 
     #[test]

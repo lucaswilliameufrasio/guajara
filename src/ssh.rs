@@ -173,10 +173,10 @@ impl SshConfig {
                 let header = self.lines[i].clone();
                 let patterns = Self::parse_host_patterns(&header);
                 let mut directives = Vec::new();
-                for j in (start + 1)..end {
-                    if let Some((key, value)) = Self::parse_directive(&self.lines[j]) {
+                for line in &self.lines[(start + 1)..end] {
+                    if let Some((key, value)) = Self::parse_directive(line) {
                         directives.push(SshDirective {
-                            raw: self.lines[j].clone(),
+                            raw: line.clone(),
                             key,
                             value,
                         });
@@ -254,12 +254,12 @@ impl SshConfig {
 
         // Try to find existing directive
         let body_start = block_start_idx + 1;
-        for i in body_start..end {
-            if let Some((k, _v)) = Self::parse_directive(&self.lines[i])
+        for line in &mut self.lines[body_start..end] {
+            if let Some((k, _v)) = Self::parse_directive(line)
                 && k.eq_ignore_ascii_case(key)
             {
                 // Preserve indentation and separator style
-                let raw = &self.lines[i];
+                let raw = &*line;
                 let indent: String = raw.chars().take_while(|c| c.is_whitespace()).collect();
                 let trimmed = raw.trim();
                 let sep = if trimmed.contains('=') { "=" } else { " " };
@@ -280,15 +280,15 @@ impl SshConfig {
                 } else {
                     format!(" {}", inline_comment)
                 };
-                self.lines[i] = format!("{}{}{}{}{}", indent, key, sep, value, comment_part);
+                *line = format!("{}{}{}{}{}", indent, key, sep, value, comment_part);
                 return Ok(());
             }
         }
 
         // Not found: insert after the last non-blank body line
         let mut insert_at = body_start;
-        for i in body_start..end {
-            if !self.lines[i].trim().is_empty() && !self.lines[i].trim().starts_with('#') {
+        for (i, line) in self.lines.iter().enumerate().take(end).skip(body_start) {
+            if !line.trim().is_empty() && !line.trim().starts_with('#') {
                 insert_at = i + 1;
             }
         }
@@ -321,8 +321,8 @@ impl SshConfig {
 
         // Collect indices to remove in reverse order
         let mut to_remove = Vec::new();
-        for i in body_start..end {
-            if let Some((k, _)) = Self::parse_directive(&self.lines[i])
+        for (i, line) in self.lines.iter().enumerate().take(end).skip(body_start) {
+            if let Some((k, _)) = Self::parse_directive(line)
                 && k.eq_ignore_ascii_case(key)
             {
                 to_remove.push(i);

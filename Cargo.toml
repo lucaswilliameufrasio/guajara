@@ -5,7 +5,7 @@ edition = "2024"
 repository = "https://github.com/lucaswilliameufrasio/guajara"
 
 [dependencies]
-clap = { version = "4.6.1", features = ["derive"] }
+clap = { version = "4.6.7", features = ["derive"] }
 crossterm = "0.29.0"
 ratatui = { version = "0.30.2", features = ["crossterm"] }
 serde = { version = "1", features = ["derive"] }

@@ -130,6 +130,44 @@ impl Client {
         Ok(keys)
     }
 
+    /// Fetch only the public half from the machine that will use the copied alias.
+    pub fn public_key(&self, identity: &str) -> Result<String, String> {
+        if identity.chars().any(char::is_control) {
+            return Err("Invalid remote identity path".into());
+        }
+        let path = if let Some(relative) = identity.strip_prefix("~/") {
+            format!("\"$HOME\"/{}", shell_quote(relative))
+        } else if identity.starts_with('/') {
+            shell_quote(identity)
+        } else {
+            return Err("Use an absolute or ~/ remote identity path".into());
+        };
+        let script = format!(
+            "set -eu\nkey={path}.pub\n[ -f \"$key\" ] || {{ echo 'Public key not found' >&2; exit 1; }}\nhead -c 16385 \"$key\""
+        );
+        let bytes = self.request(&script, Vec::new())?;
+        if bytes.len() > 16384 {
+            return Err("Remote public key is too large".into());
+        }
+        let text = std::str::from_utf8(&bytes).map_err(|_| "Invalid public key encoding")?;
+        let line = text.trim_end_matches(['\r', '\n']);
+        if line.contains(['\r', '\n']) || line.chars().any(char::is_control) {
+            return Err("Expected exactly one public key".into());
+        }
+        let mut fields = line.split_whitespace();
+        let kind = fields.next().unwrap_or_default();
+        let data = fields.next().unwrap_or_default();
+        if !(kind.starts_with("ssh-") || kind.starts_with("ecdsa-") || kind.starts_with("sk-"))
+            || data.is_empty()
+            || !data
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+        {
+            return Err("Remote file is not a supported public key".into());
+        }
+        Ok(format!("{line}\n"))
+    }
+
     pub fn write(&self, original: &Snapshot, updated: &str) -> Result<(), String> {
         let response = self.request(WRITE_SCRIPT, write_frame(original, updated)?)?;
         if response != b"GUAJARA_SAVED\n" {
@@ -142,6 +180,14 @@ impl Client {
     }
 
     pub fn create_key(&self, name: &str) -> Result<PathBuf, String> {
+        self.create_key_with_algorithm(name, crate::identity::KeyAlgorithm::Ed25519)
+    }
+
+    pub fn create_key_with_algorithm(
+        &self,
+        name: &str,
+        algorithm: crate::identity::KeyAlgorithm,
+    ) -> Result<PathBuf, String> {
         // Reuse filename validation without consulting any local key directory.
         validate_key_name(name)?;
         let script = format!(
@@ -150,9 +196,10 @@ umask 077
 mkdir -p "$HOME/.ssh"
 key="$HOME/.ssh/"{}
 [ ! -e "$key" ] && [ ! -L "$key" ] && [ ! -e "$key.pub" ] && [ ! -L "$key.pub" ] || {{ echo 'Key name already exists' >&2; exit 1; }}
-exec ssh-keygen -t ed25519 -f "$key"
+exec ssh-keygen {} -f "$key"
 "#,
-            shell_quote(name)
+            shell_quote(name),
+            algorithm.ssh_keygen_args().join(" ")
         );
         let status = self
             .command(&script, true)
@@ -184,6 +231,112 @@ exec ssh-keygen -t ed25519 -f "$key"
                 self.destination
             ))
         }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum KeyAuthorization {
+    Installed,
+    AlreadyPresent,
+}
+
+/// Install a public key over an existing local SSH login, never copying the private key.
+pub fn install_public_key(
+    config: &Path,
+    alias: &str,
+    public_key: &str,
+) -> Result<KeyAuthorization, String> {
+    if !connection::is_concrete_host(alias) {
+        return Err("Choose a concrete target alias".into());
+    }
+    if public_key.lines().count() != 1 || public_key.contains('\0') {
+        return Err("Expected exactly one public key".into());
+    }
+    let script = r#"set -eu
+umask 077
+IFS= read -r key
+IFS=' ' read -r key_type key_blob _ <<EOF
+$key
+EOF
+mkdir -p "$HOME/.ssh"
+file="$HOME/.ssh/authorized_keys"
+lock="$HOME/.ssh/.guajara-authorized-keys.lock"
+if ! mkdir "$lock" 2>/dev/null; then
+  echo 'Authorization lock exists; inspect it before retrying' >&2
+  exit 1
+fi
+trap 'rmdir "$lock"' EXIT HUP INT TERM
+[ ! -L "$file" ] || { echo 'Refusing symlink authorized_keys' >&2; exit 1; }
+if [ -e "$file" ]; then
+  [ -f "$file" ] || { echo 'authorized_keys is not a regular file' >&2; exit 1; }
+  if awk -v kind="$key_type" -v blob="$key_blob" '{ for (i=1; i<NF; i++) if ($i == kind && $(i+1) == blob) found=1 } END { exit !found }' "$file"; then
+    printf 'GUAJARA_KEY_PRESENT\n'
+    exit 0
+  else
+    result=$?
+    [ "$result" -eq 1 ] || { echo 'Could not inspect authorized_keys' >&2; exit 1; }
+  fi
+  printf '\n%s\n' "$key" >> "$file"
+else
+  printf '%s\n' "$key" > "$file"
+fi
+printf 'GUAJARA_KEY_INSTALLED\n'
+"#;
+    let mut child = Command::new("ssh")
+        .arg("-F")
+        .arg(config)
+        .arg("-T")
+        .args([
+            "-o",
+            "ClearAllForwardings=yes",
+            "-o",
+            "ForwardAgent=no",
+            "-o",
+            "ControlPath=none",
+            "-o",
+            "RemoteCommand=none",
+            "-o",
+            "SessionType=default",
+            "--",
+        ])
+        .arg(alias)
+        .arg(format!("sh -c {}", shell_quote(script)))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("Cannot run SSH: {error}"))?;
+    let write_result = child
+        .stdin
+        .take()
+        .ok_or("SSH stdin unavailable")?
+        .write_all(public_key.as_bytes());
+    let mut output = Vec::new();
+    let read_result = child
+        .stdout
+        .take()
+        .ok_or("SSH stdout unavailable")?
+        .take(4097)
+        .read_to_end(&mut output);
+    if output.len() > 4096 || read_result.is_err() {
+        let _ = child.kill();
+    }
+    let status = child
+        .wait()
+        .map_err(|error| format!("Cannot wait for SSH: {error}"))?;
+    write_result.map_err(|error| format!("Cannot send public key: {error}"))?;
+    read_result.map_err(|error| format!("Cannot read installation result: {error}"))?;
+    if !status.success() {
+        return Err(format!(
+            "Public key installation failed ({status}); the copied alias remains saved."
+        ));
+    }
+    match output.as_slice() {
+        b"GUAJARA_KEY_PRESENT\n" => Ok(KeyAuthorization::AlreadyPresent),
+        b"GUAJARA_KEY_INSTALLED\n" => Ok(KeyAuthorization::Installed),
+        _ => Err(
+            "Key installation was not acknowledged; inspect authorized_keys before retrying."
+                .into(),
+        ),
     }
 }
 

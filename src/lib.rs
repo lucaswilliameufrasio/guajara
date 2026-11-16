@@ -4,6 +4,7 @@ pub mod hosts;
 pub mod identity;
 pub mod remote;
 pub mod ssh;
+pub mod ssh_usage;
 
 pub use forward::{ForwardRule, ForwardState, Tunnel};
 pub use hosts::HostsFile;

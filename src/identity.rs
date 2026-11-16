@@ -3,6 +3,21 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyAlgorithm {
+    Ed25519,
+    Rsa4096,
+}
+
+impl KeyAlgorithm {
+    pub fn ssh_keygen_args(self) -> &'static [&'static str] {
+        match self {
+            Self::Ed25519 => &["-t", "ed25519"],
+            Self::Rsa4096 => &["-t", "rsa", "-b", "4096"],
+        }
+    }
+}
+
 /// Inspect a bounded format prefix without retaining or displaying key material.
 pub fn discover(directory: &Path) -> Result<Vec<PathBuf>, String> {
     let entries = match fs::read_dir(directory) {
@@ -88,13 +103,22 @@ fn create_identity_directory(directory: &Path) -> std::io::Result<()> {
 
 /// Inherits the terminal so ssh-keygen handles passphrase input itself.
 pub fn generate(directory: &Path, name: &str) -> Result<PathBuf, String> {
+    generate_with_algorithm(directory, name, KeyAlgorithm::Ed25519)
+}
+
+pub fn generate_with_algorithm(
+    directory: &Path,
+    name: &str,
+    algorithm: KeyAlgorithm,
+) -> Result<PathBuf, String> {
     let path = new_key_path(directory, name)?;
     if !directory.exists() {
         create_identity_directory(directory)
             .map_err(|error| format!("Cannot create SSH directory: {error}"))?;
     }
     let status = Command::new("ssh-keygen")
-        .args(["-t", "ed25519", "-f"])
+        .args(algorithm.ssh_keygen_args())
+        .arg("-f")
         .arg(&path)
         .status()
         .map_err(|error| format!("Cannot run ssh-keygen: {error}"))?;
